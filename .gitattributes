@@ -1,0 +1,8 @@
+# ==========================================================
+# Git LFS Configuration - WinSlim11
+# GitHub bloquea commits con archivos individuales superiores a 100 MB.
+# Estos archivos se gestionan mediante Git LFS para mantenerse
+# dentro de la cuota gratuita de 1 GB de GitHub.
+
+# Regla de seguridad para imágenes ISO si alguna vez se incluyeran
+*.iso filter=lfs diff=lfs merge=lfs -text
