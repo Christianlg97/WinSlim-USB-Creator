@@ -1,2 +1,5 @@
 # Ignorar imágenes ISO (exceden el límite de GitHub y Git LFS de 2 GB)
 *.iso
+
+# Repositorio / Código fuente local de Ventoy
+Codigo fuente Ventoy/
