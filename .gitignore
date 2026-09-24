@@ -1,0 +1,2 @@
+# Ignorar imágenes ISO (exceden el límite de GitHub y Git LFS de 2 GB)
+*.iso
