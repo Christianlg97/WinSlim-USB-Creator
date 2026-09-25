@@ -1,0 +1,187 @@
+## Bugtrack / Mejoras pendientes de interfaz y diagnóstico
+
+* **Título e icono de la aplicación**
+
+  El título de la interfaz y el icono actual no se visualizan correctamente y no encajan con el diseño esperado de la aplicación.
+
+  Para definir correctamente este apartado, proporcionaré imágenes de referencia que deberán utilizarse como guía visual para ajustar tanto el encabezado como el icono, manteniendo una estética coherente con el diseño general de WinSlim.
+
+* **Ventana de PowerShell visible al actualizar las unidades USB**
+
+  En el apartado **Unidad USB**, el botón **Actualizar** detecta correctamente las unidades conectadas, pero durante el proceso aparece brevemente una ventana de PowerShell.
+
+  Esta ventana no debe ser visible para el usuario.
+
+  La actualización y detección de dispositivos debe ejecutarse completamente en segundo plano, sin abrir ventanas adicionales, consolas ni procesos visibles.
+
+  Siempre que sea posible, debería evitarse depender de PowerShell para operaciones que puedan resolverse directamente desde Rust mediante APIs nativas de Windows.
+
+* **Comportamiento y redimensionamiento de la ventana principal**
+
+  La ventana de la aplicación debe ser completamente redimensionable y adaptarse correctamente cuando el usuario modifique manualmente su tamaño.
+
+  También debe ser compatible con:
+
+  * Maximizar la ventana.
+  * Restaurarla a su tamaño anterior.
+  * Redimensionamiento libre desde bordes y esquinas.
+  * Adaptación automática del contenido al tamaño disponible.
+
+  Los elementos de la interfaz no deben solaparse, cortarse, deformarse ni quedar fuera del área visible al modificar las dimensiones de la ventana.
+
+  La interfaz debe mantener una distribución coherente tanto en su tamaño inicial como al maximizarla o reducirla.
+
+* **Mejorar la visualización del apartado "Unidad USB"**
+
+  Actualmente, el listado de unidades USB se muestra demasiado comprimido verticalmente, lo que dificulta su lectura y hace que la interfaz se perciba excesivamente compacta.
+
+  Es necesario aumentar el espaciado vertical y mejorar la distribución visual de cada dispositivo.
+
+  Cada unidad debería disponer de suficiente espacio para mostrar claramente información como:
+
+  * Nombre o modelo.
+  * Letra de unidad.
+  * Capacidad.
+  * Sistema de archivos.
+  * Tipo de dispositivo.
+  * Estado o información adicional relevante.
+
+  El objetivo es conseguir una visualización más limpia, legible y cómoda, evitando que las unidades aparezcan visualmente amontonadas.
+
+  Si existen varias unidades, el listado debería poder crecer correctamente o utilizar desplazamiento vertical sin afectar al resto de la interfaz.
+
+* **Configuraciones del apartado 3**
+
+  En el apartado **3**, las configuraciones predeterminadas se muestran correctamente.
+
+  Sin embargo, actualmente, al pulsar sobre una opción, su valor cambia directamente entre las diferentes alternativas disponibles.
+
+  Este comportamiento debería sustituirse por un **menú desplegable**, de forma que el usuario pueda visualizar todas las opciones disponibles antes de seleccionar una.
+
+  Por ejemplo, al pulsar sobre:
+
+  **Tabla de particiones: MBR**
+
+  debería abrirse un desplegable con opciones como:
+
+  * MBR
+  * GPT
+
+  Del mismo modo, el sistema de archivos debería utilizar un desplegable con todas las opciones compatibles que implemente el motor de preparación USB.
+
+  Las opciones recomendadas deberán continuar seleccionadas por defecto:
+
+  * **Tabla de particiones:** MBR
+  * **Sistema de archivos:** exFAT
+
+  El usuario podrá modificarlas manualmente mediante estos menús desplegables.
+
+* **Error de red durante la descarga de la ISO**
+
+  Actualmente, al intentar descargar la ISO puede aparecer un **error de red**.
+
+  Es necesario revisar el sistema de descarga para determinar correctamente la causa del fallo y evitar mensajes de error excesivamente genéricos.
+
+  La aplicación debería distinguir, cuando sea posible, entre diferentes tipos de error, por ejemplo:
+
+  * Error de resolución DNS.
+  * Falta de conexión.
+  * Error TLS/HTTPS.
+  * Timeout.
+  * Redirección incorrecta.
+  * Error HTTP.
+  * Error al acceder a SourceForge.
+  * Error al seguir el enlace de descarga.
+  * Error al crear o escribir el archivo local.
+  * Falta de espacio disponible.
+  * Interrupción inesperada de la descarga.
+  * Respuesta inválida o incompleta del servidor.
+
+  El mensaje mostrado en la interfaz puede mantenerse relativamente sencillo para el usuario, pero la información técnica completa deberá quedar registrada en los logs.
+
+* **Sistema de logs detallado para diagnóstico**
+
+  La aplicación debe incorporar un botón o apartado accesible desde la interfaz denominado, por ejemplo:
+
+  **Logs**, **Registro** o **Diagnóstico**.
+
+  Desde este apartado deberá poder consultarse un registro detallado de las acciones realizadas por el programa.
+
+  Los logs deben ser lo suficientemente completos como para poder diagnosticar problemas futuros sin necesidad de reproducirlos directamente en un entorno de desarrollo.
+
+  Deberían registrar, entre otros datos:
+
+  * Fecha y hora exacta de cada operación.
+  * Inicio y cierre de la aplicación.
+  * Versión de la aplicación.
+  * Versión de Windows.
+  * Inicio y resultado de la detección de unidades USB.
+  * Unidades detectadas y características relevantes.
+  * Inicio de la consulta de versiones de WinSlim.
+  * URL consultada.
+  * URL final obtenida después de redirecciones.
+  * Respuestas HTTP relevantes.
+  * Inicio, progreso y finalización de las descargas.
+  * Nombre y tamaño esperado del archivo.
+  * Cantidad de datos descargados.
+  * Ruta de destino.
+  * Errores de red.
+  * Timeouts.
+  * Errores del sistema de archivos.
+  * Operaciones de preparación del USB.
+  * Creación y modificación de particiones.
+  * Formateo.
+  * Instalación del cargador de arranque.
+  * Configuración de Ventoy/GRUB.
+  * Copia de la ISO.
+  * Procesos externos ejecutados, si existieran.
+  * Código de salida de procesos auxiliares.
+  * Advertencias.
+  * Errores.
+  * Excepciones o fallos internos.
+  * Resultado final de cada operación importante.
+
+  Siempre que exista un error, el log deberá incluir el mayor contexto técnico posible, incluyendo la operación que se estaba realizando y la causa original devuelta por el sistema o librería utilizada.
+
+  No deberían descartarse los errores internos sustituyéndolos únicamente por mensajes genéricos como **"Error de red"**.
+
+  En su lugar, debería conservarse la cadena completa de errores para diagnóstico, por ejemplo:
+
+  `Descarga ISO -> petición HTTP -> conexión HTTPS -> timeout al conectar con servidor`
+
+  El apartado de logs debería permitir, como mínimo:
+
+  * Visualizar los registros directamente desde la aplicación.
+  * Actualizarlos en tiempo real mientras se ejecutan operaciones.
+  * Seleccionar y copiar texto.
+  * Copiar el log completo al portapapeles.
+  * Abrir la ubicación del archivo de log.
+  * Limpiar los logs.
+  * Exportar o guardar una copia del registro.
+
+  Los logs también deberían almacenarse en un archivo persistente para que puedan consultarse después de reiniciar la aplicación.
+
+  Es recomendable utilizar distintos niveles de registro, por ejemplo:
+
+  * INFO
+  * WARNING
+  * ERROR
+  * DEBUG
+
+  Para las versiones de desarrollo puede utilizarse un nivel especialmente detallado, mientras que en versiones estables puede mantenerse un registro completo sin generar cantidades innecesarias de información repetitiva.
+
+  Asimismo, los logs no deben almacenar información sensible innecesaria.
+
+## Objetivo general
+
+Estos cambios buscan mejorar principalmente:
+
+* La consistencia visual de la aplicación.
+* La comodidad de uso.
+* La adaptación de la interfaz a diferentes tamaños de ventana.
+* La legibilidad del listado de unidades USB.
+* La claridad de las opciones configurables.
+* La eliminación de ventanas de consola visibles durante operaciones internas.
+* La estabilidad del sistema de descarga.
+* La calidad de los mensajes de error.
+* La capacidad de diagnosticar problemas futuros mediante un sistema de logs completo y accesible desde la propia aplicación.

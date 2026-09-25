@@ -1,5 +1,24 @@
-# Ignorar imágenes ISO (exceden el límite de GitHub y Git LFS de 2 GB)
+# ISOs descargadas o creadas localmente; no son necesarias para compilar.
 *.iso
 
-# Repositorio / Código fuente local de Ventoy
-Codigo fuente Ventoy/
+# Copia local del codigo fuente de Ventoy. La compilacion utiliza el ZIP en
+# WinSlimUsbCreator/vendor/ventoy-1.1.17-windows.zip.
+/Codigo fuente Ventoy/
+
+# Salidas de compilacion, paquetes publicables y descargas temporales.
+/WinSlimUsbCreator/target/
+/WinSlimUsbCreator/cache/
+/WinSlimUsbCreator/release/
+*.part
+*.pdb
+*.log
+
+# Archivos locales de herramientas y del sistema.
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
+.env
+.env.*

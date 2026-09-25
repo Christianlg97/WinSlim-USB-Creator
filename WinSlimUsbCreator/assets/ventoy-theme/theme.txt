@@ -1,0 +1,47 @@
+desktop-image: "background.png"
+desktop-image-scale-method: "crop"
+desktop-image-h-align: "center"
+desktop-image-v-align: "center"
+desktop-color: "#000000"
+title-text: " "
+title-color: "#ffffff"
+message-color: "#f2f2f2"
+
++ image {
+    left = 21%
+    top = 3%
+    width = 50
+    height = 50
+    file = "icon.png"
+}
+
++ boot_menu {
+    left = 17%
+    top = 26%
+    width = 66%
+    height = 56%
+    item_color = "#d5d5d5"
+    selected_item_color = "#ffffff"
+    selected_item_pixmap_style = "select_*.png"
+    item_height = 34
+    item_spacing = 4
+    item_padding = 12
+    item_icon_space = 0
+    scrollbar = false
+}
+
++ hbox {
+    left = 25%
+    top = 78%
+    width = 50%
+    height = 28
+    + label { text = "[Enter] Seleccionar     Volver: elige Regresar" color = "#bcbcbc" align = "center" }
+}
+
++ hbox {
+    left = 17%
+    top = 94%
+    width = 66%
+    height = 28
+    + label { text = "@VTOY_HOTKEY_TIP@" color = "#a5a5a5" align = "center" }
+}

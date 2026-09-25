@@ -1,12 +1,14 @@
 # 🪟 WinSlim11_ISOS
 
+> La primera versión de la herramienta de escritorio para crear USB está en [WinSlimUsbCreator](WinSlimUsbCreator/README.md). La instalación real en USB y el menú de arranque personalizado siguen pendientes de validación.
+
 <div align="center">
 
 [![Windows 11](https://img.shields.io/badge/Target_OS-Windows_11_x64-0078D4?style=for-the-badge&logo=windows11&logoColor=white)](https://microsoft.com)
 [![SourceForge](https://img.shields.io/badge/Hosting-SourceForge_FRS-EE5C24?style=for-the-badge&logo=sourceforge&logoColor=white)](https://sourceforge.net/projects/winslim11-isos/)
 [![Rsync](https://img.shields.io/badge/Transfer-Rsync_over_SSH-235555?style=for-the-badge&logo=gnu-bash&logoColor=white)](https://rsync.samba.org/)
 [![Ventoy Integration](https://img.shields.io/badge/Ecosystem-Ventoy_Ready-1B73BA?style=for-the-badge&logo=linux&logoColor=white)](https://www.ventoy.net)
-[![Automation](https://img.shields.io/badge/Pipeline-Zero--Config_Batch-4EAA25?style=for-the-badge&logo=powershell&logoColor=white)](#análisis-técnico-del-script-sourceforge_uploadcmd)
+[![Automation](https://img.shields.io/badge/Pipeline-Zero--Config_Batch-4EAA25?style=for-the-badge&logo=powershell&logoColor=white)](#análisis-técnico-del-script-sourceforge_upload_isocmd)
 
 <p align="center">
   <b>Infraestructura de almacenamiento, orquestación y despliegue automatizado de imágenes ISO custom de WinSlim11 hacia SourceForge FRS, diseñada para alimentar el ecosistema downstream de creación de medios USB booteables con GRUB personalizado basado en Ventoy.</b>
@@ -14,7 +16,7 @@
 
 [Visión General](#-visión-general) •
 [Arquitectura](#-arquitectura-del-sistema) •
-[Script de Subida](#-análisis-técnico-del-script-sourceforge_uploadcmd) •
+[Script de Subida](#-análisis-técnico-del-script-sourceforge_upload_isocmd) •
 [Nomenclatura ISO](#-convención-de-nomenclatura-de-isos) •
 [Roadmap Herramienta USB](#-ecosistema-futuro-winslim-usb-installer--ventoy-core) •
 [Guía de Uso](#-guía-de-despliegue-y-uso) •
@@ -31,7 +33,7 @@
 Debido al tamaño de las imágenes completas de instalación (típicamente **~9.3 GB** con drivers, runtimes, perfiles optimizados y paquetes acumulativos integrados), la distribución de estos artefactos no es viable a través de repositorios estándar de Git ni cuotas gratuitas de Git LFS (limitadas a 100 MB / 2 GB por archivo y cuotas reducidas de ancho de banda).
 
 Este repositorio (**`WinSlim11_ISOS`**) cumple una doble función estratégica:
-1. **Pipeline de Ingesta y Despliegue:** Alojar la lógica de automatización desatendida ([SourceForge_Upload.cmd](file:///c:/Users/Administrador/Desktop/Proyectos/WinSlim11_ISOS/SourceForge_Upload.cmd)) que autogestiona el entorno de dependencias POSIX (`Cygwin64`, `rsync`, `OpenSSH`), valida los artefactos y realiza transferencias delta resilientes hacia la red CDN de SourceForge.
+1. **Pipeline de Ingesta y Despliegue:** Alojar la lógica de automatización desatendida ([SourceForge_Upload_ISO.cmd](SourceForge_Upload_ISO.cmd)) que autogestiona el entorno de dependencias POSIX (`Cygwin64`, `rsync`, `OpenSSH`), valida los artefactos y realiza transferencias delta resilientes hacia la red CDN de SourceForge.
 2. **Backbone de Enlaces Directos para Distribución Automatizada:** Generar y estandarizar los puntos de enlace directos (`downloads.sourceforge.net/project/...`) que serán consumidos por el futuro software cliente: un creador de instaladores USB basado en el código fuente de **Ventoy** con arranque **GRUB personalizado**.
 
 ---
@@ -44,7 +46,7 @@ El flujo integral comprende desde la generación local de la imagen hasta el des
 flowchart TD
     subgraph LOCAL["1. Entorno de Compilación y Subida (Este Repo)"]
         ISO["WinSlim11_*.iso\n(~9.3 GB)"]
-        CMD["SourceForge_Upload.cmd"]
+        CMD["SourceForge_Upload_ISO.cmd"]
         CYG["Bootstrap Automático\nCygwin64 + rsync + ssh\n(C:\\WSCore\\Components)"]
         
         ISO --> CMD
@@ -81,9 +83,9 @@ flowchart TD
 
 ---
 
-## ⚙ Análisis Técnico del Script `SourceForge_Upload.cmd`
+## ⚙ Análisis Técnico del Script `SourceForge_Upload_ISO.cmd`
 
-El archivo [`SourceForge_Upload.cmd`](file:///c:/Users/Administrador/Desktop/Proyectos/WinSlim11_ISOS/SourceForge_Upload.cmd) es un script de orquestación de alto nivel escrito en Windows Batch y PowerShell. Su arquitectura está dividida en 7 capas funcionales:
+El archivo [`SourceForge_Upload_ISO.cmd`](SourceForge_Upload_ISO.cmd) es un script de orquestación de alto nivel escrito en Windows Batch y PowerShell. Su arquitectura está dividida en 7 capas funcionales:
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -247,12 +249,12 @@ sequenceDiagram
 ### Procedimiento de Subida Paso a Paso
 
 1. **Colocar la ISO:**
-   Copia o mueve la imagen ISO compilada (ej. `WinSlim11_ESx64_R1.5_P-2.2.2_240926_Rev62_DEV.iso`) dentro del mismo directorio donde reside [`SourceForge_Upload.cmd`](file:///c:/Users/Administrador/Desktop/Proyectos/WinSlim11_ISOS/SourceForge_Upload.cmd).
+   Copia o mueve la imagen ISO compilada (ej. `WinSlim11_ESx64_R1.5_P-2.2.2_240926_Rev62_DEV.iso`) dentro del mismo directorio donde reside [`SourceForge_Upload_ISO.cmd`](SourceForge_Upload_ISO.cmd).
 
 2. **Ejecutar el Script:**
-   Haz doble clic sobre [`SourceForge_Upload.cmd`](file:///c:/Users/Administrador/Desktop/Proyectos/WinSlim11_ISOS/SourceForge_Upload.cmd) o ejecútalo desde un terminal:
+   Haz doble clic sobre [`SourceForge_Upload_ISO.cmd`](SourceForge_Upload_ISO.cmd) o ejecútalo desde un terminal:
    ```cmd
-   .\SourceForge_Upload.cmd
+   .\SourceForge_Upload_ISO.cmd
    ```
 
 3. **Concesión UAC:**
@@ -298,7 +300,7 @@ sequenceDiagram
 * **Solución:** Simplemente vuelve a ejecutar el script. Gracias a las banderas `-P` y `--append-verify`, `rsync` comprobará los bloques ya subidos y continuará exactamente desde el punto de interrupción.
 
 ### 4. `No se encontró ninguna ISO`
-* **Causa:** El archivo `.iso` no se encuentra en la misma carpeta que el script `SourceForge_Upload.cmd`.
+* **Causa:** El archivo `.iso` no se encuentra en la misma carpeta que el script `SourceForge_Upload_ISO.cmd`.
 * **Solución:** Asegúrate de que el archivo tenga la extensión `.iso` (no `.iso.tmp` ni nombres ocultos) y esté en la raíz del repositorio.
 
 ---
@@ -310,13 +312,13 @@ WinSlim11_ISOS/
 ├── .gitattributes             # Configuración de políticas Git LFS de resguardo
 ├── .gitignore                 # Exclusión estricta de binarios *.iso de Git
 ├── README.md                  # Documentación maestra y especificaciones técnicas
-├── SourceForge_Upload.cmd     # Orquestador automatizado de subidas a SourceForge FRS
+├── SourceForge_Upload_ISO.cmd # Orquestador automatizado de subidas a SourceForge FRS
 └── WinSlim11_*.iso            # Imágenes ISO compiladas (almacenadas localmente / ignoradas en Git)
 ```
 
 ### Política de Exclusiones Git
-* [`.gitignore`](file:///c:/Users/Administrador/Desktop/Proyectos/WinSlim11_ISOS/.gitignore): Contiene la regla `*.iso` para proteger el repositorio de commits accidentales que superen el límite estricto de 100 MB de GitHub.
-* [`.gitattributes`](file:///c:/Users/Administrador/Desktop/Proyectos/WinSlim11_ISOS/.gitattributes): Define reglas de filtro de seguridad Git LFS para imágenes ISO en caso de requerirse tracking de punteros.
+* [`.gitignore`](.gitignore): Contiene la regla `*.iso` para proteger el repositorio de commits accidentales que superen el límite estricto de 100 MB de GitHub.
+* [`.gitattributes`](.gitattributes): Define reglas Git LFS para futuros recursos binarios imprescindibles; las ISO locales permanecen ignoradas.
 
 ---
 

@@ -1,8 +1,15 @@
-# ==========================================================
-# Git LFS Configuration - WinSlim11
-# GitHub bloquea commits con archivos individuales superiores a 100 MB.
-# Estos archivos se gestionan mediante Git LFS para mantenerse
-# dentro de la cuota gratuita de 1 GB de GitHub.
+# Normalizacion de texto entre Windows y otros sistemas.
+* text=auto
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
 
-# Regla de seguridad para imágenes ISO si alguna vez se incluyeran
-*.iso filter=lfs diff=lfs merge=lfs -text
+# Recursos binarios imprescindibles que puedan superar el limite de 100 MiB
+# de GitHub. Git LFS se aplica solo a estos formatos dentro de vendor.
+# Las ISO de trabajo se ignoran y los ejecutables van a GitHub Releases.
+/WinSlimUsbCreator/vendor/*.img filter=lfs diff=lfs merge=lfs -text
+/WinSlimUsbCreator/vendor/*.wim filter=lfs diff=lfs merge=lfs -text
+/WinSlimUsbCreator/vendor/*.vhd filter=lfs diff=lfs merge=lfs -text
+/WinSlimUsbCreator/vendor/*.vhdx filter=lfs diff=lfs merge=lfs -text
+
+# Si un ZIP imprescindible supera 100 MiB, anadir su ruta exacta a LFS.
+# El ZIP de Ventoy incluido actualmente mide unos 16 MiB y queda en Git normal.
