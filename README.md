@@ -1,4 +1,4 @@
-# 🪟 WinSlim11_ISOS
+# 🪟 WinSlim USB Creator
 
 > La primera versión de la herramienta de escritorio para crear USB está en [WinSlimUsbCreator](WinSlimUsbCreator/README.md). La instalación real en USB y el menú de arranque personalizado siguen pendientes de validación.
 
