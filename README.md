@@ -24,6 +24,9 @@
 
 ---
 
+<img width="1199" height="1062" alt="image" src="https://github.com/user-attachments/assets/2963b9d6-c6ba-4b04-85b0-1c806ea6368e" />
+
+
 </div>
 
 ## 📖 Visión General
