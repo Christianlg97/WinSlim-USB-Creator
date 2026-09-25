@@ -1149,6 +1149,38 @@ fn ventoy_data_letter(disk: &Disk) -> Result<Option<String>, String> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum UsbAction {
+    CopyExisting,
+    InstallFresh,
+    Reinstall,
+}
+
+fn usb_action(
+    ventoy_expected: bool,
+    ventoy_found: bool,
+    force_reinstall: bool,
+) -> Result<UsbAction, String> {
+    if ventoy_expected && !ventoy_found {
+        return Err("Ventoy ya no se detecta en el USB. No se ha formateado; actualiza la lista y vuelve a seleccionarlo.".into());
+    }
+    if !ventoy_expected && ventoy_found {
+        return Err("El USB cambió desde la selección: ahora se detecta Ventoy. No se ha formateado; actualiza la lista y confirma de nuevo.".into());
+    }
+    if force_reinstall {
+        if !ventoy_found {
+            return Err(
+                "No se puede reinstalar Ventoy porque ya no está presente en el USB.".into(),
+            );
+        }
+        Ok(UsbAction::Reinstall)
+    } else if ventoy_found {
+        Ok(UsbAction::CopyExisting)
+    } else {
+        Ok(UsbAction::InstallFresh)
+    }
+}
+
 fn set_usb_label(root: &Path) -> Result<(), String> {
     let mut root_wide = root.as_os_str().encode_wide().collect::<Vec<_>>();
     root_wide.push(0);
@@ -1338,6 +1370,7 @@ fn prepare(
     gpt: bool,
     ntfs: bool,
     reuse_expected: bool,
+    force_reinstall: bool,
     weak: slint::Weak<MainWindow>,
 ) -> Result<String, String> {
     if !verify_file(&local_iso, &iso)? {
@@ -1351,10 +1384,9 @@ fn prepare(
         return Err("El USB seleccionado cambió. Vuelve a elegirlo.".into());
     }
     let existing_letter = ventoy_data_letter(&current)?;
-    if reuse_expected && existing_letter.is_none() {
-        return Err("Ventoy ya no se detecta en el USB. No se ha formateado; actualiza la lista y vuelve a seleccionarlo.".into());
-    }
-    if existing_letter.is_some()
+    let action = usb_action(reuse_expected, existing_letter.is_some(), force_reinstall)?;
+    let reused = action == UsbAction::CopyExisting;
+    if reused
         && iso.size > u32::MAX as u64
         && current.volumes.iter().any(|volume| {
             volume.partition_number == 1
@@ -1366,22 +1398,22 @@ fn prepare(
     {
         return Err("Ventoy está instalado, pero su partición FAT32 no admite una ISO de más de 4 GB. No se ha formateado ni modificado el USB.".into());
     }
-    if existing_letter.is_none() && iso_on_selected_disk(&local_iso, &current) {
+    if !reused && iso_on_selected_disk(&local_iso, &current) {
         return Err(
             "La ISO está guardada en el USB que se va a borrar. Muévela a otra unidad.".into(),
         );
     }
-    if existing_letter.is_none() && current.size < iso.size + 256 * 1024 * 1024 {
+    if !reused && current.size < iso.size + 256 * 1024 * 1024 {
         return Err("El USB no tiene capacidad suficiente para la ISO y Ventoy".into());
     }
     log_event(format!(
-        "PREPARE {} {} {}",
+        "PREPARE {} {} {} accion={action:?}",
         disk_label(&disk),
         if gpt { "GPT" } else { "MBR" },
         if ntfs { "NTFS" } else { "exFAT" }
     ));
-    let reused = existing_letter.is_some();
-    let letter = if let Some(letter) = existing_letter {
+    let letter = if reused {
+        let letter = existing_letter.ok_or("No se encontró la partición de datos de Ventoy")?;
         log_event(format!(
             "INFO etapa=preparar_usb ventoy_existente disco={} unidad={}",
             disk.number, letter
@@ -1396,7 +1428,7 @@ fn prepare(
         let exe = ventoy_exe()?;
         status(
             weak.clone(),
-            "Esperando la autorización de administrador para instalar Ventoy…",
+            "Instalando el cargador de arranque GRUB de Ventoy en la unidad USB…",
         );
         install_ventoy(&exe, &disk, gpt, ntfs)?;
         log_event(format!(
@@ -2004,19 +2036,52 @@ fn main() -> Result<(), slint::PlatformError> {
                 let result = fetch_latest();
                 if let Ok(iso) = &result {
                     let mut current = state.lock().unwrap();
+                    let retained = if current.iso.as_ref().is_some_and(|previous| {
+                        previous.url == iso.url
+                            && previous.name == iso.name
+                            && previous.size == iso.size
+                            && previous.md5 == iso.md5
+                    }) {
+                        current
+                            .local_iso
+                            .as_ref()
+                            .filter(|path| {
+                                fs::metadata(path).is_ok_and(|metadata| {
+                                    metadata.is_file() && metadata.len() == iso.size
+                                })
+                            })
+                            .cloned()
+                    } else {
+                        None
+                    };
                     current.iso = Some(iso.clone());
-                    current.local_iso = None;
-                    current.selected = None;
+                    current.local_iso = retained.clone();
+                    if retained.is_none() {
+                        current.selected = None;
+                    }
                     let name = iso.name.clone();
-                    let detail = format!("{} · publicado en SourceForge", human(iso.size));
+                    let detail = format!(
+                        "{} · {}",
+                        human(iso.size),
+                        if retained.is_some() {
+                            "descargada de SourceForge"
+                        } else {
+                            "publicado en SourceForge"
+                        }
+                    );
+                    let local_file = retained
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Sin descargar".into());
                     ui(weak.clone(), move |w| {
                         w.set_iso_name(name.into());
                         w.set_iso_detail(detail.into());
-                        w.set_iso_ready(true);
-                        w.set_local_iso_loaded(false);
-                        w.set_local_file("Sin descargar".into());
-                        w.set_selected_disk(-1);
-                        w.set_reuse_ventoy(false);
+                        w.set_iso_stage(if retained.is_some() { 3 } else { 1 });
+                        w.set_local_file(local_file.into());
+                        if retained.is_none() {
+                            w.set_selected_disk(-1);
+                            w.set_reuse_ventoy(false);
+                        }
                     });
                 }
                 finish(
@@ -2037,20 +2102,26 @@ fn main() -> Result<(), slint::PlatformError> {
             if !begin(&state, &window) {
                 return;
             }
+            download_state.store(DOWNLOAD_RUNNING, Ordering::Release);
+            window.set_download_active(true);
+            window.set_download_cancelling(false);
             window.set_status_text("Buscando la última ISO de WinSlim…".into());
             let weak = weak.clone();
             let state = state.clone();
             let download_state = download_state.clone();
             thread::spawn(move || {
-                let result = fetch_latest().and_then(|iso| {
-                    status(weak.clone(), "Descargando la última ISO de WinSlim…");
-                    download_state.store(DOWNLOAD_RUNNING, Ordering::Release);
-                    ui(weak.clone(), |window| {
-                        window.set_download_active(true);
-                        window.set_download_cancelling(false);
-                    });
-                    download_iso(&iso, weak.clone(), &download_state).map(|path| (iso, path))
-                });
+                let result = match fetch_latest() {
+                    Ok(iso) => {
+                        if download_state.load(Ordering::Acquire) == DOWNLOAD_RUNNING {
+                            status(weak.clone(), "Descargando la última ISO de WinSlim…");
+                        }
+                        download_iso(&iso, weak.clone(), &download_state).map(|path| (iso, path))
+                    }
+                    Err(_) if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED => {
+                        Err(DOWNLOAD_CANCELLED_MESSAGE.into())
+                    }
+                    Err(error) => Err(error),
+                };
                 if let Ok((iso, path)) = &result {
                     {
                         let mut current = state.lock().unwrap();
@@ -2065,8 +2136,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         window.set_iso_name(name.into());
                         window.set_iso_detail(detail.into());
                         window.set_local_file(local_file.into());
-                        window.set_iso_ready(true);
-                        window.set_local_iso_loaded(false);
+                        window.set_iso_stage(3);
                         window.set_selected_disk(-1);
                         window.set_reuse_ventoy(false);
                         window.set_progress(1.0);
@@ -2103,16 +2173,21 @@ fn main() -> Result<(), slint::PlatformError> {
             thread::spawn(move || {
                 let result = iso
                     .ok_or("Busca primero una ISO".to_owned())
-                    .and_then(|iso| download_iso(&iso, weak.clone(), &download_state));
-                if let Ok(path) = &result {
+                    .and_then(|iso| {
+                        download_iso(&iso, weak.clone(), &download_state).map(|path| (iso, path))
+                    });
+                if let Ok((iso, path)) = &result {
                     {
                         let mut current = state.lock().unwrap();
                         current.local_iso = Some(path.clone());
                         current.selected = None;
                     }
                     let label = path.to_string_lossy().to_string();
+                    let detail = format!("{} · descargada de SourceForge", human(iso.size));
                     ui(weak.clone(), move |w| {
                         w.set_local_file(label.into());
+                        w.set_iso_detail(detail.into());
+                        w.set_iso_stage(3);
                         w.set_progress(1.0);
                         w.set_selected_disk(-1);
                         w.set_reuse_ventoy(false);
@@ -2190,8 +2265,7 @@ fn main() -> Result<(), slint::PlatformError> {
             window.set_iso_name(name.into());
             window.set_iso_detail(format!("ISO local · {}", human(size)).into());
             window.set_local_file(path.to_string_lossy().into_owned().into());
-            window.set_iso_ready(false);
-            window.set_local_iso_loaded(true);
+            window.set_iso_stage(2);
             window.set_selected_disk(-1);
             window.set_reuse_ventoy(false);
             window.set_status_text("ISO local cargada. Selecciona un USB para continuar.".into());
@@ -2256,7 +2330,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = window.as_weak();
         let state = state.clone();
-        window.on_request_prepare(move || {
+        window.on_request_prepare(move |force_reinstall| {
             let Some(window) = weak.upgrade() else { return };
             let state = state.lock().unwrap();
             if state.iso.is_none() || state.local_iso.is_none() {
@@ -2274,8 +2348,16 @@ fn main() -> Result<(), slint::PlatformError> {
                     return;
                 }
             };
+            if force_reinstall && !reuse {
+                window.set_status_text(
+                    "No se detecta Ventoy en esta unidad. Actualiza la lista antes de prepararla."
+                        .into(),
+                );
+                return;
+            }
             window.set_selected_disk(number as i32);
             window.set_reuse_ventoy(reuse);
+            window.set_confirm_reinstall(force_reinstall);
             window.set_confirm_disk(disk_label(disk).into());
             window.set_confirm_visible(true);
         });
@@ -2300,6 +2382,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let gpt = window.get_gpt();
             let ntfs = window.get_ntfs();
             let reuse_expected = window.get_reuse_ventoy();
+            let force_reinstall = window.get_confirm_reinstall();
             let snapshot = {
                 let state = state.lock().unwrap();
                 (
@@ -2314,9 +2397,16 @@ fn main() -> Result<(), slint::PlatformError> {
             let state = state.clone();
             thread::spawn(move || {
                 let result = match snapshot {
-                    (Some(disk), Some(iso), Some(path)) => {
-                        prepare(disk, iso, path, gpt, ntfs, reuse_expected, weak.clone())
-                    }
+                    (Some(disk), Some(iso), Some(path)) => prepare(
+                        disk,
+                        iso,
+                        path,
+                        gpt,
+                        ntfs,
+                        reuse_expected,
+                        force_reinstall,
+                        weak.clone(),
+                    ),
                     _ => Err("Descarga o carga una ISO y selecciona un USB".into()),
                 };
                 let success = result.as_ref().ok().cloned();
@@ -2379,6 +2469,22 @@ fn main() -> Result<(), slint::PlatformError> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn usb_action_requires_explicit_reinstall_and_matching_ventoy_state() {
+        assert_eq!(
+            usb_action(true, true, false).unwrap(),
+            UsbAction::CopyExisting
+        );
+        assert_eq!(usb_action(true, true, true).unwrap(), UsbAction::Reinstall);
+        assert_eq!(
+            usb_action(false, false, false).unwrap(),
+            UsbAction::InstallFresh
+        );
+        assert!(usb_action(true, false, false).is_err());
+        assert!(usb_action(false, true, false).is_err());
+        assert!(usb_action(false, false, true).is_err());
+    }
 
     #[test]
     fn new_ventoy_config_uses_winslim_graphical_theme() {
@@ -2447,7 +2553,7 @@ mod tests {
             .contains("file = \"icon.png\""));
         assert!(fs::read_to_string(theme.join("theme.txt"))
             .unwrap()
-            .contains("[Enter] Seleccionar     Volver: elige Regresar"));
+            .contains("[Enter] Entrar"));
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(root.join("ventoy").join("ventoy.json")).unwrap())
                 .unwrap();

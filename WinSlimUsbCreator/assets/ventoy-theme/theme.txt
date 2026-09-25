@@ -30,12 +30,14 @@ message-color: "#f2f2f2"
     scrollbar = false
 }
 
-+ hbox {
-    left = 25%
++ label {
+    left = 0%
     top = 78%
-    width = 50%
+    width = 100%
     height = 28
-    + label { text = "[Enter] Seleccionar     Volver: elige Regresar" color = "#bcbcbc" align = "center" }
+    text = "[Enter] Entrar"
+    color = "#bcbcbc"
+    align = "center"
 }
 
 + hbox {

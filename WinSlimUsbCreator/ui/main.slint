@@ -131,11 +131,12 @@ export component MainWindow inherits Window {
     in-out property <string> status-text: "Listo";
     in-out property <float> progress: 0;
     in-out property <bool> busy: false;
-    in-out property <bool> iso-ready: false;
-    in-out property <bool> local-iso-loaded: false;
+    // 0: sin ISO; 1: ISO localizada en el servidor; 2: ISO local; 3: ISO descargada.
+    in-out property <int> iso-stage: 0;
     in-out property <bool> download-active: false;
     in-out property <bool> download-cancelling: false;
     in-out property <bool> confirm-visible: false;
+    in-out property <bool> confirm-reinstall: false;
     in-out property <string> confirm-disk: "";
     in-out property <int> selected-disk: -1;
     in-out property <[DiskRow]> disks: [];
@@ -157,7 +158,7 @@ export component MainWindow inherits Window {
     callback load-local-iso();
     callback refresh-usb();
     callback select-disk(int);
-    callback request-prepare();
+    callback request-prepare(bool);
     callback confirm-prepare();
     callback cancel-prepare();
     callback show-logs();
@@ -235,7 +236,15 @@ export component MainWindow inherits Window {
                         spacing: 8px;
                         Text { text: "01   Selecciona de dónde cargas la imagen:"; color: #b9c0cc; font-size: 12px; font-weight: 700; }
                         Text {
-                            text: "Selecciona «Buscar última» para obtener la versión más reciente de WinSlim desde el servidor, o elige «Cargar ISO local» para seleccionar una imagen ISO almacenada en tu equipo.";
+                            text: root.download-active
+                                ? "Buscando o descargando la ISO. Puedes cancelar el proceso en cualquier momento."
+                                : root.iso-stage == 1
+                                ? "La última ISO está localizada. Descárgala o selecciona una imagen local."
+                                : root.iso-stage == 2
+                                ? "La ISO local está lista. Puedes cambiarla o descargar la última versión desde el servidor."
+                                : root.iso-stage == 3
+                                ? "La ISO descargada está lista. Puedes buscar una versión más reciente o cargar otra imagen local."
+                                : "Selecciona «Buscar última ISO de WinSlim en línea» para consultar la versión más reciente, o «Cargar ISO local» para elegir una imagen de tu equipo.";
                             color: #b9c0cc;
                             font-size: 13px;
                             wrap: word-wrap;
@@ -244,16 +253,37 @@ export component MainWindow inherits Window {
                         Text { text: root.iso-detail; color: #afb4bd; font-size: 13px; }
                         HorizontalLayout {
                             spacing: 10px;
-                            ActionButton { label: "Buscar última"; width: 130px; enabled: !root.busy; clicked => { root.lookup-iso(); } }
-                            ActionButton {
-                                label: root.download-active ? root.download-cancelling ? "Cancelando…" : "Cancelar descarga" : "Descargar";
-                                width: root.download-active ? 175px : 118px;
-                                primary: !root.download-active;
-                                enabled: root.download-active ? !root.download-cancelling : !root.busy && root.iso-ready;
-                                clicked => { if (root.download-active) { root.cancel-download(); } else { root.download-iso(); } }
+                            if root.download-active : ActionButton {
+                                label: root.download-cancelling ? "Cancelando…" : "Cancelar descarga";
+                                width: 175px;
+                                enabled: !root.download-cancelling;
+                                clicked => { root.cancel-download(); }
                             }
-                            ActionButton { label: "Cargar ISO local"; width: 150px; enabled: !root.busy; clicked => { root.load-local-iso(); } }
-                            if root.local-iso-loaded && !root.download-active : ActionButton { label: "Buscar y descargar"; width: 165px; primary: true; enabled: !root.busy; clicked => { root.download-latest-iso(); } }
+                            if !root.download-active && root.iso-stage != 2 : ActionButton {
+                                label: "Buscar última ISO de WinSlim en línea";
+                                width: 280px;
+                                enabled: !root.busy;
+                                clicked => { root.lookup-iso(); }
+                            }
+                            if !root.download-active && root.iso-stage == 1 : ActionButton {
+                                label: "Descargar ISO";
+                                width: 130px;
+                                primary: true;
+                                enabled: !root.busy;
+                                clicked => { root.download-iso(); }
+                            }
+                            if !root.download-active : ActionButton {
+                                label: root.iso-stage == 2 || root.iso-stage == 3 ? "Cambiar ISO local" : "Cargar ISO local";
+                                width: 150px;
+                                enabled: !root.busy;
+                                clicked => { root.load-local-iso(); }
+                            }
+                            if !root.download-active && root.iso-stage == 2 : ActionButton {
+                                label: "Descargar última ISO";
+                                width: 185px;
+                                enabled: !root.busy;
+                                clicked => { root.download-latest-iso(); }
+                            }
                         }
                     }
                 }
@@ -272,7 +302,7 @@ export component MainWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             ActionButton { label: "Detectar unidades"; width: 154px; enabled: !root.busy; clicked => { root.refresh-usb(); } }
                         }
-                        Text { text: root.disks.length == 0 ? "No se detectaron unidades USB" : root.reuse-ventoy ? "Ventoy detectado: se conservará el contenido de esta unidad" : "Selecciona la unidad que se borrará"; color: #afb4bd; font-size: 13px; }
+                        Text { text: root.disks.length == 0 ? "No se detectaron unidades USB" : root.reuse-ventoy ? "Ventoy detectado: puedes copiar sin borrar o formatear la unidad de nuevo" : "Selecciona la unidad que se borrará"; color: #afb4bd; font-size: 13px; }
                         HorizontalLayout {
                             spacing: 12px;
                             disk-scroll := ScrollView {
@@ -346,7 +376,7 @@ export component MainWindow inherits Window {
                 }
 
                 Rectangle {
-                    height: 132px;
+                    height: root.reuse-ventoy ? 190px : 132px;
                     border-radius: 12px;
                     background: #242424;
                     border-color: #454545;
@@ -356,19 +386,33 @@ export component MainWindow inherits Window {
                         spacing: 12px;
                         Text {
                             text: root.reuse-ventoy
-                                ? "03   Configura el formato de la unidad USB y pulsa «Copiar ISO» para transferir la imagen ISO a la unidad."
-                                : "03   Configura el formato de la unidad USB y pulsa «Preparar USB» para instalar Ventoy y transferir la imagen ISO a la unidad.";
+                                ? "03   Copia la ISO sin borrar los archivos, o formatea y prepara de nuevo la unidad con el formato seleccionado."
+                                : "03   Elige el formato de la unidad y pulsa «Preparar USB» para instalar Ventoy y copiar la ISO.";
                             color: #b9c0cc;
                             font-size: 12px;
                             font-weight: 700;
                             wrap: word-wrap;
                         }
-                        HorizontalLayout {
+                        if !root.reuse-ventoy : HorizontalLayout {
                             spacing: 12px;
                             RoundedSelect { options: ["MBR (recomendado)", "GPT"]; current-index: root.gpt ? 1 : 0; width: 175px; enabled: !root.busy; selected(index) => { root.gpt = index == 1; } }
                             RoundedSelect { options: ["exFAT (recomendado)", "NTFS"]; current-index: root.ntfs ? 1 : 0; width: 195px; enabled: !root.busy; selected(index) => { root.ntfs = index == 1; } }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
-                            ActionButton { label: root.reuse-ventoy ? "Copiar ISO" : "Preparar USB"; width: 156px; primary: true; enabled: !root.busy && root.selected-disk >= 0; clicked => { root.request-prepare(); } }
+                            ActionButton { label: "Preparar USB"; width: 156px; primary: true; enabled: !root.busy && root.selected-disk >= 0 && root.iso-stage >= 2; clicked => { root.request-prepare(false); } }
+                        }
+                        if root.reuse-ventoy : VerticalLayout {
+                            spacing: 12px;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                RoundedSelect { options: ["MBR (recomendado)", "GPT"]; current-index: root.gpt ? 1 : 0; width: 175px; enabled: !root.busy; selected(index) => { root.gpt = index == 1; } }
+                                RoundedSelect { options: ["exFAT (recomendado)", "NTFS"]; current-index: root.ntfs ? 1 : 0; width: 195px; enabled: !root.busy; selected(index) => { root.ntfs = index == 1; } }
+                            }
+                            HorizontalLayout {
+                                spacing: 12px;
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                ActionButton { label: "Copiar ISO al USB seleccionado"; width: 245px; primary: true; enabled: !root.busy && root.selected-disk >= 0 && root.iso-stage >= 2; clicked => { root.request-prepare(false); } }
+                                ActionButton { label: "Formatear y preparar de nuevo"; width: 255px; enabled: !root.busy && root.selected-disk >= 0 && root.iso-stage >= 2; clicked => { root.request-prepare(true); } }
+                            }
                         }
                     }
                 }
@@ -411,15 +455,15 @@ export component MainWindow inherits Window {
             VerticalLayout {
                 padding: 25px;
                 spacing: 17px;
-                Text { text: root.reuse-ventoy ? "Confirmar copia de la ISO" : "Confirmar borrado del USB"; color: #ffffff; font-size: 21px; font-weight: 700; }
-                Text { text: root.reuse-ventoy ? "Ventoy ya está instalado. Se conservarán sus particiones y archivos en:" : "Se eliminarán todas las particiones y todos los datos de:"; color: #d1d4da; font-size: 14px; wrap: word-wrap; }
+                Text { text: root.reuse-ventoy && !root.confirm-reinstall ? "Confirmar copia de la ISO" : "Confirmar formateo del USB"; color: #ffffff; font-size: 21px; font-weight: 700; }
+                Text { text: root.reuse-ventoy && !root.confirm-reinstall ? "Ventoy ya está instalado. Se conservarán sus particiones y archivos en:" : "Se eliminarán todas las particiones y todos los datos de:"; color: #d1d4da; font-size: 14px; wrap: word-wrap; }
                 Text { text: root.confirm-disk; color: #ffffff; font-size: 15px; font-weight: 700; wrap: word-wrap; }
-                Text { text: root.reuse-ventoy ? "Solo se añadirá la ISO. Si ya existe otra con el mismo nombre, se guardará una copia nueva." : "Comprueba el modelo y la capacidad antes de continuar."; color: #bfc5cd; font-size: 13px; wrap: word-wrap; }
+                Text { text: root.reuse-ventoy && !root.confirm-reinstall ? "Solo se añadirá la ISO. Si ya existe otra con el mismo nombre, se guardará una copia nueva." : root.confirm-reinstall ? "Se reinstalará Ventoy con el formato elegido y después se copiará la ISO." : "Comprueba el modelo y la capacidad antes de continuar."; color: #bfc5cd; font-size: 13px; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; background: transparent; }
                 HorizontalLayout {
                     spacing: 10px;
                     ActionButton { label: "Cancelar"; width: 130px; clicked => { root.cancel-prepare(); } }
-                    ActionButton { label: root.reuse-ventoy ? "Copiar ISO" : "Borrar y preparar"; width: 175px; primary: true; clicked => { root.confirm-prepare(); } }
+                    ActionButton { label: root.reuse-ventoy && !root.confirm-reinstall ? "Copiar ISO" : "Borrar y preparar"; width: 175px; primary: true; clicked => { root.confirm-prepare(); } }
                 }
             }
         }
