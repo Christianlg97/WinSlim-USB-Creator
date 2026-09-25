@@ -1,47 +1,71 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 slint::include_modules!();
+
+#[cfg(target_os = "windows")]
+#[path = "platform/windows.rs"]
+mod platform;
+#[cfg(target_os = "linux")]
+#[path = "platform/linux.rs"]
+mod platform;
+use platform::*;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use slint::winit_030::winit::event::WindowEvent;
-use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::winit_030::{EventResult, WinitWindowAccessor};
 use slint::{ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::{
     cell::Cell,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    os::windows::{ffi::OsStrExt, process::CommandExt},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
 };
-use windows_sys::Win32::Storage::FileSystem::{
-    GetDiskFreeSpaceExW, MoveFileExW, MoveFileW, SetVolumeLabelW, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH,
-};
-use windows_sys::Win32::{
-    Foundation::RECT,
-    Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
-    },
-    UI::WindowsAndMessaging::{GetClientRect, SystemParametersInfoW, SPI_GETWORKAREA},
-};
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[derive(Clone, Copy, Debug)]
+enum FirmwareFeatureState {
+    Enabled,
+    Disabled,
+    Unknown,
+}
+
+impl FirmwareFeatureState {
+    fn ui_value(self) -> i32 {
+        match self {
+            Self::Enabled => 1,
+            Self::Disabled => 0,
+            Self::Unknown => -1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FirmwareSecurityStatus {
+    tpm: FirmwareFeatureState,
+    secure_boot: FirmwareFeatureState,
+}
+
 const DOWNLOAD_IDLE: u8 = 0;
 const DOWNLOAD_RUNNING: u8 = 1;
 const DOWNLOAD_CANCELLED: u8 = 2;
 const DOWNLOAD_COMMITTING: u8 = 3;
 const DOWNLOAD_CANCELLED_MESSAGE: &str = "Descarga cancelada";
+const PARALLEL_CONNECTIONS: usize = 4;
+const DOWNLOAD_SEGMENT_BYTES: u64 = 32 * 1024 * 1024;
+const PARALLEL_MIN_BYTES: u64 = 64 * 1024 * 1024;
+const MIRROR_PROBE_BYTES: u64 = 512 * 1024;
+const MAX_MIRROR_PROBES: usize = 8;
 
 fn check_download_cancellation(download_state: &AtomicU8) -> Result<(), String> {
     if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED {
@@ -63,41 +87,10 @@ fn commit_download(download_state: &AtomicU8) -> Result<(), String> {
         .map_err(|_| DOWNLOAD_CANCELLED_MESSAGE.into())
 }
 
-#[repr(C)]
-struct OsVersionInfo {
-    size: u32,
-    major: u32,
-    minor: u32,
-    build: u32,
-    platform: u32,
-    service_pack: [u16; 128],
-}
-
-#[link(name = "ntdll")]
-extern "system" {
-    fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
-}
-
-fn windows_version() -> String {
-    let mut info = OsVersionInfo {
-        size: std::mem::size_of::<OsVersionInfo>() as u32,
-        major: 0,
-        minor: 0,
-        build: 0,
-        platform: 0,
-        service_pack: [0; 128],
-    };
-    if unsafe { RtlGetVersion(&mut info) } == 0 {
-        format!("{}.{}.{}", info.major, info.minor, info.build)
-    } else {
-        "desconocida".into()
-    }
-}
-
 const RSS: &str = "https://sourceforge.net/projects/winslim11-isos/rss?path=/";
-const VENTOY_SHA256: &str = "d250e97a7595fdac4f97debc630d7a8da942319274a76cb32384596b659dbaeb";
-const VENTOY_ARCHIVE: &[u8] = include_bytes!("../vendor/ventoy-1.1.17-windows.zip");
-
+const ALTERNATIVE_RELEASE_API: &str =
+    "https://api.github.com/repos/Christianlg97/WinSlim_Mirroring/releases/tags/Latest_Mirror_URL";
+const ALTERNATIVE_RELEASE_TAG: &str = "Latest_Mirror_URL";
 #[derive(Clone)]
 struct Iso {
     name: String,
@@ -111,6 +104,9 @@ struct Iso {
 #[serde(rename_all = "PascalCase")]
 struct Disk {
     number: u32,
+    #[serde(default)]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    device_path: Option<String>,
     friendly_name: String,
     serial_number: Option<String>,
     size: u64,
@@ -126,23 +122,18 @@ struct Disk {
 #[serde(rename_all = "PascalCase")]
 struct Volume {
     letter: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    mount_path: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    device_path: Option<String>,
     label: Option<String>,
     file_system: Option<String>,
     #[serde(default)]
     size: u64,
     #[serde(default)]
     partition_number: u32,
-}
-
-fn drive_letter(volume: &Volume) -> Option<char> {
-    let text = volume.letter.as_deref()?;
-    let mut chars = text.chars();
-    let letter = chars.next()?;
-    if letter.is_ascii_alphabetic() && chars.next().is_none() {
-        Some(letter.to_ascii_uppercase())
-    } else {
-        None
-    }
 }
 
 #[derive(Default)]
@@ -211,14 +202,6 @@ fn finish_download(
     );
 }
 
-fn log_path() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|base| {
-        PathBuf::from(base)
-            .join("WinSlimUsbCreator")
-            .join("operations.log")
-    })
-}
-
 fn log_event(message: String) {
     let Some(path) = log_path() else {
         return;
@@ -237,7 +220,7 @@ fn log_event(message: String) {
 
 fn read_log() -> String {
     let Some(path) = log_path() else {
-        return "No se encontró LOCALAPPDATA".into();
+        return "No se encontró el directorio del registro".into();
     };
     match fs::read_to_string(path) {
         Ok(contents) => {
@@ -305,7 +288,7 @@ fn http_error(stage: &str, error: ureq::Error) -> String {
 }
 
 fn file_error(stage: &str, path: &Path, error: std::io::Error) -> String {
-    let summary = if error.raw_os_error() == Some(112) {
+    let summary = if matches!(error.raw_os_error(), Some(112 | 28)) {
         "No hay espacio suficiente en el disco"
     } else if error.kind() == std::io::ErrorKind::PermissionDenied {
         "No hay permiso para escribir el archivo"
@@ -329,6 +312,7 @@ fn begin(state: &Arc<Mutex<State>>, window: &MainWindow) -> bool {
     state.busy = true;
     window.set_busy(true);
     window.set_progress(0.0);
+    window.set_preparation_complete(false);
     true
 }
 
@@ -353,6 +337,60 @@ fn fetch_latest() -> Result<Iso, String> {
         iso.name, iso.size, iso.md5
     ));
     Ok(iso)
+}
+
+#[derive(Deserialize)]
+struct AlternativeRelease {
+    tag_name: String,
+    body: Option<String>,
+}
+
+fn alternative_link_from_notes(notes: &str) -> Result<url::Url, String> {
+    let mut selected = None;
+    for (start, _) in notes.match_indices("https://") {
+        // match_indices devuelve la coincidencia, no el resto de la URL.
+        let raw = notes[start..]
+            .split(|character: char| {
+                character.is_whitespace() || matches!(character, ')' | ']' | '>' | '<' | '"' | '\'')
+            })
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(['.', ',', ';']);
+        let decoded = raw.replace("&amp;", "&");
+        if let Ok(link) = url::Url::parse(&decoded) {
+            if link.scheme() == "https"
+                && link.host_str().is_some()
+                && link.username().is_empty()
+                && link.password().is_none()
+            {
+                if selected.as_ref().is_some_and(|previous| previous != &link) {
+                    return Err("Las notas de la release contienen varios enlaces HTTPS; no se puede identificar la descarga".into());
+                }
+                selected = Some(link);
+            }
+        }
+    }
+    selected.ok_or_else(|| {
+        "Las notas de la release no contienen un enlace HTTPS de descarga válido".into()
+    })
+}
+
+fn fetch_alternative_link() -> Result<url::Url, String> {
+    log_event(format!(
+        "INFO etapa=consultar_descarga_alternativa url={ALTERNATIVE_RELEASE_API}"
+    ));
+    let response = ureq::get(ALTERNATIVE_RELEASE_API)
+        .set("User-Agent", "WinSlimUsbCreator/0.1")
+        .set("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(15))
+        .call()
+        .map_err(|error| format!("No se pudo consultar la release de GitHub: {error}"))?;
+    let release: AlternativeRelease = serde_json::from_reader(response.into_reader())
+        .map_err(|error| format!("La respuesta de GitHub no es válida: {error}"))?;
+    if release.tag_name != ALTERNATIVE_RELEASE_TAG {
+        return Err("GitHub devolvió una release distinta de la esperada".into());
+    }
+    alternative_link_from_notes(release.body.as_deref().unwrap_or(""))
 }
 
 fn parse_latest(xml: &str) -> Result<Iso, String> {
@@ -415,68 +453,15 @@ fn parse_latest(xml: &str) -> Result<Iso, String> {
         .ok_or_else(|| "No se encontró ninguna ISO válida en el RSS de SourceForge".into())
 }
 
-fn powershell(script: &str) -> Result<String, String> {
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("PowerShell: {e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn disks() -> Result<Vec<Disk>, String> {
-    const SCRIPT: &str = r#"$ErrorActionPreference='Stop'; @(Get-Disk | Where-Object { $_.BusType -eq 'USB' -and -not $_.IsBoot -and -not $_.IsSystem } | ForEach-Object { $d=$_; $v=@(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue | ForEach-Object { $p=$_; $vol=$p | Get-Volume -ErrorAction SilentlyContinue; $label=''; $fs=''; if ($vol) { $label=[string]$vol.FileSystemLabel; $fs=[string]$vol.FileSystem }; [pscustomobject]@{ Letter=[string]$p.DriveLetter; Label=$label; FileSystem=$fs; Size=[uint64]$p.Size; PartitionNumber=[uint32]$p.PartitionNumber } }); [pscustomobject]@{ Number=$d.Number; FriendlyName=[string]$d.FriendlyName; SerialNumber=[string]$d.SerialNumber; Size=[uint64]$d.Size; BusType=[string]$d.BusType; IsBoot=[bool]$d.IsBoot; IsSystem=[bool]$d.IsSystem; IsReadOnly=[bool]$d.IsReadOnly; Volumes=$v } }) | ConvertTo-Json -Depth 5 -Compress"#;
-    let output = powershell(SCRIPT)?;
-    if output.is_empty() || output == "null" {
-        return Ok(Vec::new());
-    }
-    let value: serde_json::Value =
-        serde_json::from_str(&output).map_err(|e| format!("Discos: {e}"))?;
-    let values = if let Some(array) = value.as_array() {
-        array.clone()
-    } else {
-        vec![value]
-    };
-    let found: Result<Vec<Disk>, String> = values
-        .into_iter()
-        .map(|value| serde_json::from_value(value).map_err(|e| e.to_string()))
-        .collect();
-    let found = found?;
-    log_event(format!("INFO etapa=detectar_usb cantidad={}", found.len()));
-    for disk in &found {
-        log_event(format!(
-            "DEBUG etapa=detectar_usb numero={} modelo={} bytes={} bus={} readonly={} volumenes={}",
-            disk.number,
-            disk.friendly_name,
-            disk.size,
-            disk.bus_type,
-            disk.is_read_only,
-            disk.volumes.len()
-        ));
-    }
-    Ok(found)
-}
-
 fn disk_label(disk: &Disk) -> String {
     let letters = disk
         .volumes
         .iter()
-        .filter_map(drive_letter)
-        .map(|letter| format!("{letter}:"))
+        .filter_map(volume_display)
         .collect::<Vec<_>>()
         .join(", ");
     let letter_part = if letters.is_empty() {
-        "sin letra".to_owned()
+        "sin montar".to_owned()
     } else {
         letters
     };
@@ -519,10 +504,17 @@ fn disk_rows(disks: &[Disk]) -> Vec<DiskRow> {
 }
 
 fn human(bytes: u64) -> String {
-    if bytes >= 1_000_000_000 {
-        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64).replace('.', ",")
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64).replace('.', ",")
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64).replace('.', ",")
     } else {
-        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+        format!("{bytes} B")
     }
 }
 
@@ -570,13 +562,335 @@ fn retry_iso_download(
     Ok(())
 }
 
+// AB Download Manager reparte los ficheros que admiten rangos entre varias
+// conexiones. Aquí usamos lotes acotados para conservar el archivo .part como
+// prefijo continuo y poder volver al descargador de una conexión sin perderlo.
+fn download_range(
+    url: &str,
+    path: &Path,
+    from: u64,
+    to: u64,
+    total: u64,
+    progress: &AtomicU64,
+    abort: &AtomicBool,
+    download_state: &AtomicU8,
+) -> Result<(), String> {
+    let mut completed = 0;
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        if abort.load(Ordering::Acquire) {
+            return Err("Descarga por fragmentos detenida".into());
+        }
+        check_download_cancellation(download_state)?;
+        let resume_from = from + completed;
+        let expected_range = format!("bytes {resume_from}-{to}/{total}");
+        let expected_length = to - resume_from + 1;
+        let agent = ureq::builder()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(15))
+            .build();
+        let response = agent
+            .get(url)
+            .set("User-Agent", "WinSlimUsbCreator/0.1")
+            .set("Accept-Encoding", "identity")
+            .set("Range", &format!("bytes={resume_from}-{to}"))
+            .call();
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = http_error("descargar fragmento", error);
+                if attempt < 2 {
+                    thread::sleep(Duration::from_secs(1));
+                }
+                continue;
+            }
+        };
+        if response.status() != 206
+            || response.header("Content-Range") != Some(expected_range.as_str())
+            || response
+                .header("Content-Length")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length != expected_length)
+            || response
+                .header("Content-Type")
+                .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+            || response
+                .header("Content-Encoding")
+                .is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+        {
+            return Err("El espejo no respetó el rango solicitado".into());
+        }
+        let mut reader = response.into_reader();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| file_error("crear fragmento temporal", path, error))?;
+        file.set_len(completed)
+            .map_err(|error| file_error("ajustar fragmento temporal", path, error))?;
+        file.seek(SeekFrom::Start(completed))
+            .map_err(|error| file_error("reanudar fragmento temporal", path, error))?;
+        let mut remaining = expected_length;
+        let mut buffer = [0u8; 256 * 1024];
+        let result = (|| -> Result<(), String> {
+            while remaining > 0 {
+                if abort.load(Ordering::Acquire) {
+                    return Err("Descarga por fragmentos detenida".into());
+                }
+                check_download_cancellation(download_state)?;
+                let limit = remaining.min(buffer.len() as u64) as usize;
+                let length = reader
+                    .read(&mut buffer[..limit])
+                    .map_err(|error| format!("Lectura del fragmento: {error}"))?;
+                if length == 0 {
+                    return Err("El espejo cerró un fragmento antes de completarlo".into());
+                }
+                file.write_all(&buffer[..length])
+                    .map_err(|error| file_error("guardar fragmento", path, error))?;
+                remaining -= length as u64;
+                completed += length as u64;
+                progress.store(completed, Ordering::Release);
+            }
+            file.sync_all()
+                .map_err(|error| file_error("guardar fragmento", path, error))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error == DOWNLOAD_CANCELLED_MESSAGE => return Err(error),
+            Err(error) => last_error = error,
+        }
+        if attempt < 2 {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+    Err(last_error)
+}
+
+fn download_iso_parallel(
+    iso: &Iso,
+    preferred_url: Option<&str>,
+    weak: slint::Weak<MainWindow>,
+    dir: &Path,
+    part: &Path,
+    downloaded: &mut u64,
+    hash: &mut md5::Context,
+    download_state: &AtomicU8,
+    initial_bytes: u64,
+    start: Instant,
+    last_update: &mut Instant,
+) -> Result<(), String> {
+    let temp_dir = dir.join(format!("{}.part-segments", iso.name));
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir)
+            .map_err(|error| file_error("limpiar fragmentos anteriores", &temp_dir, error))?;
+    }
+    if iso.md5.is_none() {
+        log_event("INFO etapa=descarga_paralela md5_no_disponible usar_una_conexion".into());
+        return Ok(());
+    }
+    if iso.size.saturating_sub(*downloaded) < PARALLEL_MIN_BYTES {
+        return Ok(());
+    }
+    let url = if let Some(url) = preferred_url {
+        url.to_owned()
+    } else {
+        match resolve_download(iso) {
+            Ok(url) => url,
+            Err(error) => {
+                log_event(format!("WARNING etapa=descarga_paralela motivo={error}"));
+                return Ok(());
+            }
+        }
+    };
+    check_download_cancellation(download_state)?;
+    // Una petición mínima comprueba el soporte real de Range. No basta con
+    // Accept-Ranges: algunos espejos lo anuncian pero devuelven el archivo entero.
+    let probe = ureq::builder()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(15))
+        .build()
+        .get(&url)
+        .set("User-Agent", "WinSlimUsbCreator/0.1")
+        .set("Accept-Encoding", "identity")
+        .set("Range", "bytes=0-0")
+        .call();
+    let supports_ranges = probe.is_ok_and(|response| {
+        response.status() == 206
+            && response.header("Content-Range") == Some(format!("bytes 0-0/{}", iso.size).as_str())
+            && response.header("Content-Length") == Some("1")
+    });
+    if !supports_ranges {
+        log_event("INFO etapa=descarga_paralela rangos_no_disponibles usar_una_conexion".into());
+        return Ok(());
+    }
+    fs::create_dir(&temp_dir)
+        .map_err(|error| file_error("crear carpeta de fragmentos", &temp_dir, error))?;
+    log_event(format!(
+        "INFO etapa=descarga_paralela conexiones={} fragmento_bytes={DOWNLOAD_SEGMENT_BYTES}",
+        PARALLEL_CONNECTIONS
+    ));
+    let result = (|| -> Result<(), String> {
+        while *downloaded < iso.size {
+            check_download_cancellation(download_state)?;
+            let batch_bytes = iso
+                .size
+                .saturating_sub(*downloaded)
+                .min(DOWNLOAD_SEGMENT_BYTES * PARALLEL_CONNECTIONS as u64);
+            if fs_free_bytes(dir)? < iso.size.saturating_sub(*downloaded) + batch_bytes {
+                log_event(
+                    "INFO etapa=descarga_paralela espacio_temporal_insuficiente usar_una_conexion"
+                        .into(),
+                );
+                break;
+            }
+            let batch_end = *downloaded + batch_bytes;
+            let mut ranges = Vec::new();
+            let mut from = *downloaded;
+            while from < batch_end {
+                let to = (from + DOWNLOAD_SEGMENT_BYTES).min(batch_end) - 1;
+                ranges.push((from, to));
+                from = to + 1;
+            }
+            let abort = AtomicBool::new(false);
+            let progress = (0..ranges.len())
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>();
+            let failure = thread::scope(|scope| {
+                let (sender, receiver) = mpsc::channel();
+                for (index, &(from, to)) in ranges.iter().enumerate() {
+                    let sender = sender.clone();
+                    let slot = &progress[index];
+                    let abort = &abort;
+                    let path = temp_dir.join(format!("{index}.segment"));
+                    let url = &url;
+                    scope.spawn(move || {
+                        let result = download_range(
+                            url,
+                            &path,
+                            from,
+                            to,
+                            iso.size,
+                            slot,
+                            abort,
+                            download_state,
+                        );
+                        let _ = sender.send(result);
+                    });
+                }
+                drop(sender);
+                let mut received = 0;
+                let mut failure = None;
+                while received < ranges.len() {
+                    if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED {
+                        abort.store(true, Ordering::Release);
+                    }
+                    match receiver.recv_timeout(Duration::from_millis(250)) {
+                        Ok(Ok(())) => received += 1,
+                        Ok(Err(error)) => {
+                            received += 1;
+                            abort.store(true, Ordering::Release);
+                            if failure.is_none() {
+                                failure = Some(error);
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            failure =
+                                Some("Un fragmento terminó sin informar del resultado".into());
+                            break;
+                        }
+                    }
+                    if last_update.elapsed() >= Duration::from_millis(250) {
+                        let in_flight = progress
+                            .iter()
+                            .map(|slot| slot.load(Ordering::Acquire))
+                            .sum::<u64>();
+                        let received_bytes = (*downloaded + in_flight).min(iso.size);
+                        let speed = received_bytes.saturating_sub(initial_bytes) as f64
+                            / start.elapsed().as_secs_f64().max(0.1);
+                        let remaining = (iso.size.saturating_sub(received_bytes) as f64
+                            / speed.max(1.0)) as u64;
+                        let message = format!(
+                            "Descargando · {} / {} · {}/s · {} restantes",
+                            human(received_bytes),
+                            human(iso.size),
+                            human(speed as u64),
+                            format_duration(remaining)
+                        );
+                        let fraction =
+                            (received_bytes as f64 / iso.size as f64).clamp(0.0, 1.0) as f32;
+                        ui(weak.clone(), move |window| {
+                            window.set_status_text(message.into());
+                            window.set_progress(fraction);
+                        });
+                        *last_update = Instant::now();
+                    }
+                }
+                failure
+            });
+            check_download_cancellation(download_state)?;
+            if let Some(error) = failure {
+                log_event(format!(
+                    "WARNING etapa=descarga_paralela motivo={error} reanudar_desde={}",
+                    *downloaded
+                ));
+                break;
+            }
+            let mut output = if *downloaded == 0 {
+                File::create(part)
+                    .map_err(|error| file_error("crear descarga temporal", part, error))?
+            } else {
+                OpenOptions::new()
+                    .append(true)
+                    .open(part)
+                    .map_err(|error| file_error("reanudar descarga temporal", part, error))?
+            };
+            let mut buffer = vec![0u8; 1024 * 1024];
+            for (index, &(from, to)) in ranges.iter().enumerate() {
+                let path = temp_dir.join(format!("{index}.segment"));
+                let mut input = File::open(&path)
+                    .map_err(|error| file_error("abrir fragmento temporal", &path, error))?;
+                if input.metadata().map_err(|error| error.to_string())?.len() != to - from + 1 {
+                    return Err("Un fragmento no tiene el tamaño esperado".into());
+                }
+                loop {
+                    check_download_cancellation(download_state)?;
+                    let length = input
+                        .read(&mut buffer)
+                        .map_err(|error| file_error("leer fragmento", &path, error))?;
+                    if length == 0 {
+                        break;
+                    }
+                    output
+                        .write_all(&buffer[..length])
+                        .map_err(|error| file_error("unir fragmentos", part, error))?;
+                    hash.consume(&buffer[..length]);
+                    *downloaded += length as u64;
+                }
+                drop(input);
+                fs::remove_file(&path)
+                    .map_err(|error| file_error("eliminar fragmento unido", &path, error))?;
+            }
+            output
+                .sync_all()
+                .map_err(|error| file_error("guardar descarga", part, error))?;
+        }
+        Ok(())
+    })();
+    let cleanup = fs::remove_dir_all(&temp_dir)
+        .map_err(|error| file_error("eliminar fragmentos temporales", &temp_dir, error));
+    result?;
+    cleanup?;
+    Ok(())
+}
+
 fn download_iso(
     iso: &Iso,
     weak: slint::Weak<MainWindow>,
     download_state: &AtomicU8,
 ) -> Result<PathBuf, String> {
-    let home = std::env::var_os("USERPROFILE").ok_or("No se encontró el perfil de usuario")?;
-    let dir = PathBuf::from(home).join("Downloads").join("WinSlim");
+    let dir = downloads_dir()?;
     download_iso_to(iso, weak, &dir, download_state)
 }
 
@@ -594,6 +908,7 @@ fn download_iso_to(
             .is_some_and(|error| error == DOWNLOAD_CANCELLED_MESSAGE)
     {
         let part = dir.join(format!("{}.part", iso.name));
+        let segments = dir.join(format!("{}.part-segments", iso.name));
         match fs::remove_file(&part) {
             Ok(()) => log_event(format!(
                 "INFO etapa=descargar_iso cancelada archivo_parcial_eliminado={}",
@@ -601,6 +916,10 @@ fn download_iso_to(
             )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(file_error("eliminar descarga cancelada", &part, error)),
+        }
+        if segments.exists() {
+            fs::remove_dir_all(&segments)
+                .map_err(|error| file_error("eliminar fragmentos cancelados", &segments, error))?;
         }
         return Err(DOWNLOAD_CANCELLED_MESSAGE.into());
     }
@@ -686,10 +1005,29 @@ fn download_iso_to_inner(
     let mut last_update = Instant::now() - Duration::from_secs(2);
     let mut last_log = Instant::now();
     let mut attempts = 0;
+    let mut preferred_url = choose_download_mirror(iso, weak.clone(), download_state);
+    check_download_cancellation(download_state)?;
+    download_iso_parallel(
+        iso,
+        preferred_url.as_deref(),
+        weak.clone(),
+        dir,
+        &part,
+        &mut downloaded,
+        &mut hash,
+        download_state,
+        initial_bytes,
+        start,
+        &mut last_update,
+    )?;
     while downloaded < iso.size {
         check_download_cancellation(download_state)?;
-        status(weak.clone(), "Seleccionando un espejo de SourceForge…");
-        let direct_url = match resolve_download(iso) {
+        status(weak.clone(), "Conectando con SourceForge…");
+        let selected_url = match preferred_url.take() {
+            Some(url) => Ok(url),
+            None => resolve_download(iso),
+        };
+        let direct_url = match selected_url {
             Ok(url) => url,
             Err(error) => {
                 retry_iso_download(
@@ -881,6 +1219,7 @@ fn download_iso_to_inner(
         ));
     }
     if let Some(expected) = &iso.md5 {
+        status(weak.clone(), "Verificando la integridad de la ISO…");
         let actual = format!("{:x}", hash.compute());
         if !actual.eq_ignore_ascii_case(expected) {
             log_event(format!(
@@ -902,6 +1241,169 @@ fn download_iso_to_inner(
         final_path.display()
     ));
     Ok(final_path)
+}
+
+fn parse_mirror_choices(html: &str) -> Vec<String> {
+    let Some(list) = html.split_once("<ul id=\"mirrorList\">") else {
+        return Vec::new();
+    };
+    let Some((list, _)) = list.1.split_once("</ul>") else {
+        return Vec::new();
+    };
+    let mut mirrors = Vec::new();
+    for item in list.split("<li id=\"").skip(1) {
+        let Some((name, _)) = item.split_once('"') else {
+            continue;
+        };
+        if name != "autoselect"
+            && !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && !mirrors.iter().any(|known: &String| known.as_str() == name)
+        {
+            mirrors.push(name.to_owned());
+        }
+    }
+    mirrors
+}
+
+fn available_mirrors(iso: &Iso) -> Result<Vec<String>, String> {
+    let response = ureq::get("https://sourceforge.net/settings/mirror_choices")
+        .query("projectname", "winslim11-isos")
+        .query("filename", &iso.name)
+        .set("User-Agent", "WinSlimUsbCreator/0.1")
+        .timeout(Duration::from_secs(8))
+        .call()
+        .map_err(|error| http_error("consultar espejos", error))?;
+    let mut html = String::new();
+    response
+        .into_reader()
+        .take(256 * 1024)
+        .read_to_string(&mut html)
+        .map_err(|error| format!("No se pudo leer la lista de espejos: {error}"))?;
+    Ok(parse_mirror_choices(&html))
+}
+
+fn probe_mirror(
+    iso: &Iso,
+    mirror: &str,
+    download_state: &AtomicU8,
+) -> Option<(String, String, Duration)> {
+    if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED {
+        return None;
+    }
+    let sample = MIRROR_PROBE_BYTES.min(iso.size);
+    let range = format!("bytes=0-{}", sample - 1);
+    let url = format!("{}?use_mirror={mirror}", iso.url);
+    let start = Instant::now();
+    let response = ureq::builder()
+        .timeout_connect(Duration::from_secs(3))
+        .timeout_read(Duration::from_secs(4))
+        .build()
+        .get(&url)
+        .set("User-Agent", "WinSlimUsbCreator/0.1")
+        .set("Accept-Encoding", "identity")
+        .set("Range", &range)
+        .call()
+        .ok()?;
+    if response.status() != 206
+        || response.header("Content-Range")
+            != Some(format!("bytes 0-{}/{size}", sample - 1, size = iso.size).as_str())
+        || response
+            .header("Content-Type")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+    {
+        return None;
+    }
+    let direct_url = response.get_url().to_owned();
+    let actual_host = direct_url.strip_prefix("https://")?.split('/').next()?;
+    let expected_host = format!("{mirror}.dl.sourceforge.net");
+    if actual_host != expected_host.as_str() {
+        return None;
+    }
+    if !direct_url.contains(&format!("/project/winslim11-isos/{}", iso.name)) {
+        return None;
+    }
+    let mut reader = response.into_reader();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut received = 0;
+    while received < sample {
+        if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED
+            || start.elapsed() > Duration::from_secs(5)
+        {
+            return None;
+        }
+        let limit = (sample - received).min(buffer.len() as u64) as usize;
+        let length = reader.read(&mut buffer[..limit]).ok()?;
+        if length == 0 {
+            return None;
+        }
+        received += length as u64;
+    }
+    Some((mirror.to_owned(), direct_url, start.elapsed()))
+}
+
+fn choose_download_mirror(
+    iso: &Iso,
+    weak: slint::Weak<MainWindow>,
+    download_state: &AtomicU8,
+) -> Option<String> {
+    status(weak.clone(), "Consultando los espejos de SourceForge…");
+    let mut mirrors = match available_mirrors(iso) {
+        Ok(mirrors) => mirrors,
+        Err(error) => {
+            log_event(format!(
+                "WARNING etapa=elegir_espejo motivo={error} usando_automatico"
+            ));
+            return None;
+        }
+    };
+    if mirrors.len() <= 1 {
+        log_event(format!(
+            "INFO etapa=elegir_espejo disponibles={} unico={}",
+            mirrors.len(),
+            mirrors.first().map(String::as_str).unwrap_or("ninguno")
+        ));
+        status(weak, "Iniciando descarga de la ISO…");
+        return None;
+    }
+    mirrors.sort_by_key(|mirror| mirror.as_str() == "master");
+    mirrors.truncate(MAX_MIRROR_PROBES);
+    status(weak.clone(), "Comparando la velocidad de los espejos…");
+    let results = thread::scope(|scope| {
+        let probes = mirrors
+            .iter()
+            .map(|mirror| scope.spawn(move || probe_mirror(iso, mirror, download_state)))
+            .collect::<Vec<_>>();
+        probes
+            .into_iter()
+            .filter_map(|probe| probe.join().ok().flatten())
+            .collect::<Vec<_>>()
+    });
+    if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED {
+        return None;
+    }
+    for (mirror, url, elapsed) in &results {
+        log_event(format!(
+            "INFO etapa=medir_espejo solicitado={mirror} servidor={} bytes={} segundos={:.2}",
+            url.split('?').next().unwrap_or(""),
+            MIRROR_PROBE_BYTES,
+            elapsed.as_secs_f64()
+        ));
+    }
+    let selected = results.into_iter().min_by_key(|(_, _, elapsed)| *elapsed);
+    if let Some((mirror, url, _)) = selected {
+        log_event(format!("INFO etapa=elegir_espejo seleccionado={mirror}"));
+        status(
+            weak,
+            format!("Espejo seleccionado: {mirror}. Iniciando descarga…"),
+        );
+        Some(url)
+    } else {
+        log_event("WARNING etapa=elegir_espejo sin_candidatos_validos usando_automatico".into());
+        None
+    }
 }
 
 fn resolve_download(iso: &Iso) -> Result<String, String> {
@@ -950,6 +1452,71 @@ fn resolve_download(iso: &Iso) -> Result<String, String> {
     Ok(url)
 }
 
+fn check_latest_download_available() -> Result<(), String> {
+    let iso = fetch_latest()?;
+    let url = resolve_download(&iso)?;
+    // Solo leemos el primer byte: la comprobación no descarga la ISO.
+    let response = ureq::builder()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(10))
+        .build()
+        .get(&url)
+        .set("User-Agent", "WinSlimUsbCreator/0.1")
+        .set("Accept-Encoding", "identity")
+        .set("Range", "bytes=0-0")
+        .call()
+        .map_err(|error| http_error("comprobar disponibilidad de ISO", error))?;
+    if response
+        .header("Content-Type")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
+    {
+        return Err("El servidor devolvió una página HTML en lugar de la ISO".into());
+    }
+    let correct_file = match response.status() {
+        206 => response.header("Content-Range") == Some(format!("bytes 0-0/{}", iso.size).as_str()),
+        200 => {
+            response
+                .header("Content-Length")
+                .and_then(|value| value.parse::<u64>().ok())
+                == Some(iso.size)
+        }
+        _ => false,
+    };
+    if !correct_file {
+        return Err("El servidor no confirmó el tamaño de la ISO publicada".into());
+    }
+    let mut reader = response.into_reader();
+    let mut first_byte = [0u8; 1];
+    if reader
+        .read(&mut first_byte)
+        .map_err(|error| format!("No se pudo leer la ISO: {error}"))?
+        != 1
+    {
+        return Err("El servidor no entregó datos de la ISO".into());
+    }
+    Ok(())
+}
+
+fn start_server_check(weak: slint::Weak<MainWindow>, running: Arc<AtomicBool>) {
+    if running.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    thread::spawn(move || {
+        let result = check_latest_download_available();
+        let available = result.is_ok();
+        match result {
+            Ok(()) => log_event("INFO etapa=comprobar_servidor iso_disponible=true".into()),
+            Err(error) => log_event(format!(
+                "WARNING etapa=comprobar_servidor iso_disponible=false detalle={error}"
+            )),
+        }
+        ui(weak, move |window| {
+            window.set_server_availability(if available { 1 } else { -1 });
+        });
+        running.store(false, Ordering::Release);
+    });
+}
+
 fn verify_file(path: &Path, iso: &Iso) -> Result<bool, String> {
     if fs::metadata(path).map_err(|e| e.to_string())?.len() != iso.size {
         return Ok(false);
@@ -975,177 +1542,6 @@ fn format_duration(seconds: u64) -> String {
         format!("{} h {} min", seconds / 3600, seconds % 3600 / 60)
     } else {
         format!("{} min {} s", seconds / 60, seconds % 60)
-    }
-}
-
-fn ventoy_exe() -> Result<PathBuf, String> {
-    log_event("INFO etapa=ventoy verificar_paquete=sha256 version=1.1.17".into());
-    let mut hash = Sha256::new();
-    hash.update(VENTOY_ARCHIVE);
-    if format!("{:x}", hash.finalize()) != VENTOY_SHA256 {
-        return Err("El paquete de Ventoy no pasó la verificación SHA-256".into());
-    }
-    let base = std::env::var_os("LOCALAPPDATA").ok_or("No se encontró LOCALAPPDATA")?;
-    let dir = PathBuf::from(base)
-        .join("WinSlimUsbCreator")
-        .join("ventoy-1.1.17");
-    let package = dir.join("ventoy-1.1.17");
-    let exe = package.join("Ventoy2Disk_X64.exe");
-    if exe.exists() && package.join("ventoy").join("ventoy.disk.img.xz").exists() {
-        log_event(format!(
-            "INFO etapa=ventoy paquete_extraido ruta={}",
-            package.display()
-        ));
-        return Ok(exe);
-    }
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let mut archive =
-        zip::ZipArchive::new(std::io::Cursor::new(VENTOY_ARCHIVE)).map_err(|e| e.to_string())?;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        let Some(name) = entry.enclosed_name() else {
-            return Err("Ruta no segura en el paquete de Ventoy".into());
-        };
-        let target = dir.join(name);
-        if entry.is_dir() {
-            fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-            continue;
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let mut output = File::create(&target).map_err(|e| e.to_string())?;
-        std::io::copy(&mut entry, &mut output).map_err(|e| e.to_string())?;
-    }
-    let alternate = package.join("altexe").join("Ventoy2Disk_X64.exe");
-    fs::copy(alternate, &exe).map_err(|e| format!("No se pudo preparar Ventoy x64: {e}"))?;
-    log_event(format!(
-        "INFO etapa=ventoy paquete_extraido ruta={}",
-        package.display()
-    ));
-    Ok(exe)
-}
-
-fn ps_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-fn install_ventoy(exe: &Path, disk: &Disk, gpt: bool, ntfs: bool) -> Result<(), String> {
-    let path = ps_quote(&exe.to_string_lossy());
-    let install_dir = exe.parent().ok_or("Directorio de Ventoy no válido")?;
-    let done = install_dir.join("cli_done.txt");
-    let _ = fs::remove_file(&done);
-    let mut args = format!(
-        "VTOYCLI /I /PhyDrive:{} /FS:{}",
-        disk.number,
-        if ntfs { "NTFS" } else { "EXFAT" }
-    );
-    if gpt {
-        args.push_str(" /GPT");
-    }
-    log_event(format!(
-        "INFO etapa=instalar_ventoy ejecutable={} argumentos={args}",
-        exe.display()
-    ));
-    let script = format!("$ErrorActionPreference='Stop'; $p=Start-Process -FilePath {path} -WorkingDirectory {} -ArgumentList {} -Verb RunAs -Wait -PassThru; if ($null -eq $p) {{ exit 1 }}; exit $p.ExitCode", ps_quote(&install_dir.to_string_lossy()), ps_quote(&args));
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("Elevación: {e}"))?;
-    log_event(format!(
-        "INFO etapa=instalar_ventoy proceso_auxiliar=powershell.exe exit_code={:?} stderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    ));
-    if let Ok(contents) = fs::read_to_string(install_dir.join("cli_log.txt")) {
-        let max = 100_000;
-        let mut start = contents.len().saturating_sub(max);
-        while !contents.is_char_boundary(start) {
-            start += 1;
-        }
-        log_event(format!(
-            "DEBUG etapa=instalar_ventoy cli_log_inicio\n{}\ncli_log_fin",
-            &contents[start..]
-        ));
-    }
-    if !output.status.success() {
-        return Err(format!(
-            "Ventoy terminó con error o se canceló UAC (código {:?}): {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let marker = fs::read_to_string(&done)
-        .map_err(|_| "Ventoy no generó su marcador de finalización".to_owned())?;
-    if marker.trim() != "0" {
-        log_event(format!(
-            "ERROR etapa=instalar_ventoy marcador={} log={}",
-            marker.trim(),
-            install_dir.join("cli_log.txt").display()
-        ));
-        return Err("Ventoy informó que la instalación falló; revisa cli_log.txt".into());
-    }
-    log_event(format!(
-        "INFO etapa=instalar_ventoy resultado=OK marcador={} log={}",
-        marker.trim(),
-        install_dir.join("cli_log.txt").display()
-    ));
-    Ok(())
-}
-
-fn same_disk(a: &Disk, b: &Disk) -> bool {
-    a.number == b.number
-        && a.size == b.size
-        && a.bus_type.eq_ignore_ascii_case("USB")
-        && !b.is_boot
-        && !b.is_system
-        && !b.is_read_only
-        && a.serial_number.as_deref().unwrap_or("").trim()
-            == b.serial_number.as_deref().unwrap_or("").trim()
-}
-
-fn ventoy_data_letter(disk: &Disk) -> Result<Option<String>, String> {
-    let efi = disk.volumes.iter().find(|volume| {
-        volume
-            .label
-            .as_deref()
-            .is_some_and(|label| label.eq_ignore_ascii_case("VTOYEFI"))
-    });
-    let data = disk.volumes.iter().find(|volume| {
-        volume.partition_number == 1
-            && drive_letter(volume).is_some()
-            && volume.file_system.as_deref().is_some_and(|fs| {
-                fs.eq_ignore_ascii_case("exFAT")
-                    || fs.eq_ignore_ascii_case("NTFS")
-                    || fs.eq_ignore_ascii_case("FAT32")
-            })
-    });
-    if let (Some(efi), Some(data)) = (efi, data) {
-        let valid_efi = efi.partition_number != data.partition_number
-            && (8 * 1024 * 1024..=256 * 1024 * 1024).contains(&efi.size)
-            && efi.file_system.as_deref().is_some_and(|fs| {
-                fs.eq_ignore_ascii_case("FAT") || fs.eq_ignore_ascii_case("FAT32")
-            });
-        if valid_efi {
-            return Ok(drive_letter(data).map(|letter| letter.to_string()));
-        }
-    }
-    let looks_like_ventoy = efi.is_some()
-        || disk.volumes.iter().any(|volume| {
-            volume.label.as_deref().is_some_and(|label| {
-                label.eq_ignore_ascii_case("Ventoy") || label.eq_ignore_ascii_case("WinSlim USB")
-            })
-        })
-        || (data.is_some()
-            && disk.volumes.iter().any(|volume| {
-                volume.partition_number != 1
-                    && (8 * 1024 * 1024..=256 * 1024 * 1024).contains(&volume.size)
-            }));
-    if looks_like_ventoy {
-        Err("El USB parece tener Ventoy, pero no se pudo verificar su partición de arranque VTOYEFI. No se formateó; revisa la unidad.".into())
-    } else {
-        Ok(None)
     }
 }
 
@@ -1179,54 +1575,6 @@ fn usb_action(
     } else {
         Ok(UsbAction::InstallFresh)
     }
-}
-
-fn set_usb_label(root: &Path) -> Result<(), String> {
-    let mut root_wide = root.as_os_str().encode_wide().collect::<Vec<_>>();
-    root_wide.push(0);
-    let mut label_wide = "WinSlim USB".encode_utf16().collect::<Vec<_>>();
-    label_wide.push(0);
-    if unsafe { SetVolumeLabelW(root_wide.as_ptr(), label_wide.as_ptr()) } == 0 {
-        return Err(file_error(
-            "asignar etiqueta WinSlim USB",
-            root,
-            std::io::Error::last_os_error(),
-        ));
-    }
-    log_event(format!(
-        "INFO etapa=etiquetar_usb unidad={} etiqueta=WinSlim USB",
-        root.display()
-    ));
-    Ok(())
-}
-
-fn publish_iso(from: &Path, to: &Path) -> Result<(), String> {
-    let mut from_wide = from.as_os_str().encode_wide().collect::<Vec<_>>();
-    from_wide.push(0);
-    let mut to_wide = to.as_os_str().encode_wide().collect::<Vec<_>>();
-    to_wide.push(0);
-    // MoveFileW falla si el destino ya existe: no sobrescribe una ISO del usuario.
-    if unsafe { MoveFileW(from_wide.as_ptr(), to_wide.as_ptr()) } == 0 {
-        return Err(file_error(
-            "finalizar copia USB",
-            to,
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
-}
-
-fn iso_on_selected_disk(path: &Path, disk: &Disk) -> bool {
-    let path_text = path.to_string_lossy();
-    let bytes = path_text.as_bytes();
-    if bytes.len() < 2 || bytes[1] != b':' {
-        return false;
-    }
-    let letter = bytes[0].to_ascii_uppercase();
-    disk.volumes
-        .iter()
-        .filter_map(drive_letter)
-        .any(|volume| volume as u8 == letter)
 }
 
 const WINSLIM_THEME_PATH: &str = "/ventoy/winslim-theme/theme.txt";
@@ -1337,182 +1685,13 @@ fn install_winslim_ventoy_theme(root: &Path) -> Result<bool, String> {
         file.sync_all()
             .map_err(|error| file_error("sincronizar configuración temporal", &pending, error))?;
         drop(file);
-        let mut from = pending.as_os_str().encode_wide().collect::<Vec<_>>();
-        let mut to = config_path.as_os_str().encode_wide().collect::<Vec<_>>();
-        from.push(0);
-        to.push(0);
-        if unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(file_error(
-                "publicar configuración de Ventoy",
-                &config_path,
-                std::io::Error::last_os_error(),
-            ));
-        }
+        publish_config(&pending, &config_path)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&pending);
     }
     result.map(|_| true)
-}
-
-fn prepare(
-    disk: Disk,
-    iso: Iso,
-    local_iso: PathBuf,
-    gpt: bool,
-    ntfs: bool,
-    reuse_expected: bool,
-    force_reinstall: bool,
-    weak: slint::Weak<MainWindow>,
-) -> Result<String, String> {
-    if !verify_file(&local_iso, &iso)? {
-        return Err("La ISO local no coincide con SourceForge. Descárgala de nuevo.".into());
-    }
-    let current = disks()?
-        .into_iter()
-        .find(|d| d.number == disk.number)
-        .ok_or("El USB seleccionado ya no está conectado")?;
-    if !same_disk(&disk, &current) {
-        return Err("El USB seleccionado cambió. Vuelve a elegirlo.".into());
-    }
-    let existing_letter = ventoy_data_letter(&current)?;
-    let action = usb_action(reuse_expected, existing_letter.is_some(), force_reinstall)?;
-    let reused = action == UsbAction::CopyExisting;
-    if reused
-        && iso.size > u32::MAX as u64
-        && current.volumes.iter().any(|volume| {
-            volume.partition_number == 1
-                && volume
-                    .file_system
-                    .as_deref()
-                    .is_some_and(|fs| fs.eq_ignore_ascii_case("FAT32"))
-        })
-    {
-        return Err("Ventoy está instalado, pero su partición FAT32 no admite una ISO de más de 4 GB. No se ha formateado ni modificado el USB.".into());
-    }
-    if !reused && iso_on_selected_disk(&local_iso, &current) {
-        return Err(
-            "La ISO está guardada en el USB que se va a borrar. Muévela a otra unidad.".into(),
-        );
-    }
-    if !reused && current.size < iso.size + 256 * 1024 * 1024 {
-        return Err("El USB no tiene capacidad suficiente para la ISO y Ventoy".into());
-    }
-    log_event(format!(
-        "PREPARE {} {} {} accion={action:?}",
-        disk_label(&disk),
-        if gpt { "GPT" } else { "MBR" },
-        if ntfs { "NTFS" } else { "exFAT" }
-    ));
-    let letter = if reused {
-        let letter = existing_letter.ok_or("No se encontró la partición de datos de Ventoy")?;
-        log_event(format!(
-            "INFO etapa=preparar_usb ventoy_existente disco={} unidad={}",
-            disk.number, letter
-        ));
-        status(
-            weak.clone(),
-            "Ventoy ya está instalado; se conservarán sus datos…",
-        );
-        letter
-    } else {
-        status(weak.clone(), "Verificando el paquete oficial de Ventoy…");
-        let exe = ventoy_exe()?;
-        status(
-            weak.clone(),
-            "Instalando el cargador de arranque GRUB de Ventoy en la unidad USB…",
-        );
-        install_ventoy(&exe, &disk, gpt, ntfs)?;
-        log_event(format!(
-            "INFO etapa=preparar_usb particionado_y_formato_completados disco={}",
-            disk.number
-        ));
-        status(weak.clone(), "Buscando la nueva partición de datos…");
-        let mut target = None;
-        for _ in 0..30 {
-            thread::sleep(Duration::from_secs(2));
-            if let Some(updated) = disks()?.into_iter().find(|d| d.number == disk.number) {
-                if !same_disk(&disk, &updated) {
-                    return Err("El dispositivo USB cambió durante la instalación".into());
-                }
-                target = ventoy_data_letter(&updated).ok().flatten();
-                if target.is_some() {
-                    break;
-                }
-            }
-        }
-        target.ok_or("Ventoy terminó, pero no se pudo verificar su partición de datos y VTOYEFI")?
-    };
-    let root = PathBuf::from(format!("{}:\\", letter.chars().next().unwrap()));
-    if !reused {
-        set_usb_label(&root)?;
-    }
-    let destination = if reused {
-        unused_iso_path(&root, &iso.name)
-    } else {
-        root.join(&iso.name)
-    };
-    log_event(format!(
-        "INFO etapa=copiar_iso origen={} destino={} bytes={}",
-        local_iso.display(),
-        destination.display(),
-        iso.size
-    ));
-    let free = fs_free_bytes(&root)?;
-    if free < iso.size {
-        return Err("La nueva partición no tiene espacio suficiente para la ISO".into());
-    }
-    let temporary = root.join(format!(
-        ".winslim-copy-{}-{}.part",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos()
-    ));
-    status(weak.clone(), "Copiando la ISO al USB…");
-    if let Err(error) = copy_with_progress(&local_iso, &temporary, iso.size, weak.clone()) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if let Err(error) = publish_iso(&temporary, &destination) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    status(weak.clone(), "Configurando el tema de arranque de WinSlim…");
-    let theme_warning = match install_winslim_ventoy_theme(&root) {
-        Ok(true) => {
-            log_event(format!(
-                "INFO etapa=configurar_ventoy tema=winslim archivo={}",
-                root.join("ventoy").join("ventoy.json").display()
-            ));
-            ""
-        }
-        Ok(false) => {
-            log_event("INFO etapa=configurar_ventoy tema=personalizado_conservado".to_string());
-            ""
-        }
-        Err(error) => {
-            log_event(format!("ERROR etapa=configurar_ventoy detalle={error}"));
-            " · tema no aplicado (consulta Registro)"
-        }
-    };
-    Ok(format!(
-        "USB preparado: Disco {} · {} · {}: · {}{}",
-        disk.number,
-        disk.friendly_name,
-        letter,
-        destination.file_name().unwrap().to_string_lossy(),
-        theme_warning
-    ))
 }
 
 fn unused_iso_path(root: &Path, name: &str) -> PathBuf {
@@ -1531,25 +1710,6 @@ fn unused_iso_path(root: &Path, name: &str) -> PathBuf {
         }
     }
     unreachable!()
-}
-
-fn fs_free_bytes(root: &Path) -> Result<u64, String> {
-    let mut wide = root.as_os_str().encode_wide().collect::<Vec<_>>();
-    wide.push(0);
-    let mut free = 0u64;
-    let success = unsafe {
-        GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut free,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if success == 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(file_error("comprobar espacio libre", root, error));
-    }
-    Ok(free)
 }
 
 fn copy_with_progress(
@@ -1694,129 +1854,21 @@ fn copy_and_verify(
     Ok(())
 }
 
-fn blurred_backdrop(window: &MainWindow) -> Option<slint::Image> {
-    let hwnd = window.window().with_winit_window(|native| {
-        match native.window_handle().ok()?.as_raw() {
-            RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as *mut std::ffi::c_void),
-            _ => None,
-        }
-    })??;
-    let mut rect = RECT::default();
-    if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
-        return None;
-    }
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
-    if width <= 0 || height <= 0 || width > 4096 || height > 4096 {
-        return None;
-    }
-    let source_dc = unsafe { GetDC(hwnd) };
-    if source_dc.is_null() {
-        return None;
-    }
-    let memory_dc = unsafe { CreateCompatibleDC(source_dc) };
-    let bitmap = unsafe { CreateCompatibleBitmap(source_dc, width, height) };
-    if memory_dc.is_null() || bitmap.is_null() {
-        if !bitmap.is_null() {
-            unsafe { DeleteObject(bitmap) };
-        }
-        if !memory_dc.is_null() {
-            unsafe { DeleteDC(memory_dc) };
-        }
-        unsafe { ReleaseDC(hwnd, source_dc) };
-        return None;
-    }
-    let previous = unsafe { SelectObject(memory_dc, bitmap) };
-    let copied = unsafe { BitBlt(memory_dc, 0, 0, width, height, source_dc, 0, 0, SRCCOPY) };
-    unsafe { SelectObject(memory_dc, previous) };
-    let mut info = BITMAPINFO::default();
-    info.bmiHeader.biSize = std::mem::size_of_val(&info.bmiHeader) as u32;
-    info.bmiHeader.biWidth = width;
-    info.bmiHeader.biHeight = -height;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    let mut pixels = vec![0u8; width as usize * height as usize * 4];
-    let read = unsafe {
-        GetDIBits(
-            memory_dc,
-            bitmap,
-            0,
-            height as u32,
-            pixels.as_mut_ptr().cast(),
-            &mut info,
-            DIB_RGB_COLORS,
-        )
-    };
-    unsafe {
-        DeleteObject(bitmap);
-        DeleteDC(memory_dc);
-        ReleaseDC(hwnd, source_dc);
-    }
-    if copied == 0 || read != height {
-        return None;
-    }
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-        pixel[3] = 255;
-    }
-    let frame = image::RgbaImage::from_raw(width as u32, height as u32, pixels)?;
-    let small = image::imageops::resize(
-        &frame,
-        (width as u32 / 4).max(1),
-        (height as u32 / 4).max(1),
-        image::imageops::FilterType::Triangle,
-    );
-    let blurred = image::imageops::blur(&small, 4.0);
-    let mut output =
-        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(blurred.width(), blurred.height());
-    for (target, source) in output.make_mut_slice().iter_mut().zip(blurred.pixels()) {
-        *target = slint::Rgba8Pixel {
-            r: source[0],
-            g: source[1],
-            b: source[2],
-            a: 255,
-        };
-    }
-    Some(slint::Image::from_rgba8(output))
-}
-
-fn size_initial_window(window: &MainWindow) {
-    let mut work_area = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    let found = unsafe {
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut work_area as *mut RECT).cast(), 0)
-    };
-    if found == 0 {
-        return;
-    }
-    let scale = window.window().scale_factor().max(1.0);
-    let available_width = (work_area.right - work_area.left) as f32 / scale - 24.0;
-    let available_height = (work_area.bottom - work_area.top) as f32 / scale - 48.0;
-    let width = 1200.0_f32.min(available_width).max(680.0);
-    let height = 985.0_f32.min(available_height).min(width * 0.84).max(530.0);
-    window
-        .window()
-        .set_size(slint::LogicalSize::new(width, height));
-}
-
 fn main() -> Result<(), slint::PlatformError> {
     std::panic::set_hook(Box::new(|info| log_event(format!("ERROR panic={info}"))));
     log_event(format!(
-        "INFO evento=inicio version={} windows={} arquitectura={}",
+        "INFO evento=inicio version={} sistema={} arquitectura={}",
         env!("CARGO_PKG_VERSION"),
-        windows_version(),
+        os_version(),
         std::env::consts::ARCH
     ));
     let window = MainWindow::new()?;
     size_initial_window(&window);
+    window.set_restart_instructions(restart_instructions().into());
     // En Windows, softbuffer puede reutilizar su caché de daños aunque el área
     // cliente se haya vaciado al minimizar. Invalidar el fondo obliga a Slint
     // a pintar de nuevo toda la ventana al restaurarla o maximizarla.
+    #[cfg(target_os = "windows")]
     {
         let weak = window.as_weak();
         let redraw_pending = Rc::new(Cell::new(false));
@@ -1842,6 +1894,21 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     let state = Arc::new(Mutex::new(State::default()));
     let download_state = Arc::new(AtomicU8::new(DOWNLOAD_IDLE));
+
+    {
+        let weak = window.as_weak();
+        thread::spawn(move || {
+            let detected = firmware_security_status();
+            log_event(format!(
+                "INFO etapa=seguridad_firmware tpm={:?} secure_boot={:?}",
+                detected.tpm, detected.secure_boot
+            ));
+            ui(weak, move |window| {
+                window.set_tpm_status(detected.tpm.ui_value());
+                window.set_secure_boot_status(detected.secure_boot.ui_value());
+            });
+        });
+    }
 
     {
         let weak = window.as_weak();
@@ -1889,30 +1956,9 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             let weak = weak.clone();
             thread::spawn(move || {
-                let shutdown = PathBuf::from(
-                    std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
-                )
-                .join("System32")
-                .join("shutdown.exe");
-                let result = Command::new(shutdown)
-                    .args(["/r", "/o", "/t", "0"])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .output();
-                let error = match result {
-                    Ok(output) if output.status.success() => return,
-                    Ok(output) => {
-                        let detail = if output.stderr.is_empty() {
-                            &output.stdout
-                        } else {
-                            &output.stderr
-                        };
-                        format!(
-                            "Windows no pudo iniciar el reinicio (código {:?}): {}",
-                            output.status.code(),
-                            String::from_utf8_lossy(detail).trim()
-                        )
-                    }
-                    Err(error) => format!("Windows no pudo iniciar el reinicio: {error}"),
+                let error = match restart_to_usb() {
+                    Ok(()) => return,
+                    Err(error) => error,
                 };
                 log_event(format!("ERROR etapa=reiniciar_usb detalle={error}"));
                 ui(weak, move |window| {
@@ -1934,6 +1980,18 @@ fn main() -> Result<(), slint::PlatformError> {
                         w.set_log_text(contents.into());
                     }
                 }
+            }
+        });
+    }
+
+    let server_timer = Timer::default();
+    {
+        let weak = window.as_weak();
+        let running = Arc::new(AtomicBool::new(false));
+        start_server_check(weak.clone(), running.clone());
+        server_timer.start(TimerMode::Repeated, Duration::from_secs(180), move || {
+            if weak.upgrade().is_some_and(|window| !window.get_busy()) {
+                start_server_check(weak.clone(), running.clone());
             }
         });
     }
@@ -1966,7 +2024,7 @@ fn main() -> Result<(), slint::PlatformError> {
     window.on_open_log_folder(move || {
         if let Some(path) = log_path() {
             if let Some(dir) = path.parent() {
-                if let Err(e) = Command::new("explorer.exe").arg(dir).spawn() {
+                if let Err(e) = open_folder(dir) {
                     log_event(format!("ERROR etapa=registro abrir_carpeta={e}"));
                 }
             }
@@ -1999,7 +2057,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             };
             let result = log_path()
-                .ok_or_else(|| "No se encontró LOCALAPPDATA".to_owned())
+                .ok_or_else(|| "No se encontró el directorio del registro".to_owned())
                 .and_then(|source| fs::copy(source, &target).map_err(|e| e.to_string()));
             if let Some(w) = weak.upgrade() {
                 match result {
@@ -2060,22 +2118,14 @@ fn main() -> Result<(), slint::PlatformError> {
                         current.selected = None;
                     }
                     let name = iso.name.clone();
-                    let detail = format!(
-                        "{} · {}",
-                        human(iso.size),
-                        if retained.is_some() {
-                            "descargada de SourceForge"
-                        } else {
-                            "publicado en SourceForge"
-                        }
-                    );
+                    let size = human(iso.size);
                     let local_file = retained
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "Sin descargar".into());
                     ui(weak.clone(), move |w| {
                         w.set_iso_name(name.into());
-                        w.set_iso_detail(detail.into());
+                        w.set_iso_size(size.into());
                         w.set_iso_stage(if retained.is_some() { 3 } else { 1 });
                         w.set_local_file(local_file.into());
                         if retained.is_none() {
@@ -2130,11 +2180,12 @@ fn main() -> Result<(), slint::PlatformError> {
                         current.selected = None;
                     }
                     let name = iso.name.clone();
-                    let detail = format!("{} · descargada de SourceForge", human(iso.size));
+                    let size = human(iso.size);
                     let local_file = path.to_string_lossy().into_owned();
                     ui(weak.clone(), move |window| {
                         window.set_iso_name(name.into());
-                        window.set_iso_detail(detail.into());
+                        window.set_iso_size(size.into());
+                        window.set_server_availability(1);
                         window.set_local_file(local_file.into());
                         window.set_iso_stage(3);
                         window.set_selected_disk(-1);
@@ -2183,10 +2234,11 @@ fn main() -> Result<(), slint::PlatformError> {
                         current.selected = None;
                     }
                     let label = path.to_string_lossy().to_string();
-                    let detail = format!("{} · descargada de SourceForge", human(iso.size));
+                    let size = human(iso.size);
                     ui(weak.clone(), move |w| {
                         w.set_local_file(label.into());
-                        w.set_iso_detail(detail.into());
+                        w.set_iso_size(size.into());
+                        w.set_server_availability(1);
                         w.set_iso_stage(3);
                         w.set_progress(1.0);
                         w.set_selected_disk(-1);
@@ -2199,6 +2251,33 @@ fn main() -> Result<(), slint::PlatformError> {
                     state,
                     download_state,
                 );
+            });
+        });
+    }
+
+    {
+        let weak = window.as_weak();
+        let state = state.clone();
+        window.on_download_alternative_iso(move || {
+            let Some(window) = weak.upgrade() else { return };
+            let has_iso = state.lock().unwrap().iso.is_some();
+            if !has_iso || !begin(&state, &window) {
+                return;
+            }
+            window.set_status_text("Consultando el enlace alternativo en GitHub…".into());
+            let weak = weak.clone();
+            let state = state.clone();
+            thread::spawn(move || {
+                let result = fetch_alternative_link().and_then(|link| {
+                    open_url(link.as_str())
+                        .map_err(|error| format!("No se pudo abrir el navegador: {error}"))?;
+                    log_event(format!(
+                        "INFO etapa=descarga_alternativa dominio={}",
+                        link.host_str().unwrap_or("")
+                    ));
+                    Ok("Enlace de descarga alternativo abierto en el navegador".into())
+                });
+                finish(weak, result, state);
             });
         });
     }
@@ -2263,9 +2342,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 path.display()
             ));
             window.set_iso_name(name.into());
-            window.set_iso_detail(format!("ISO local · {}", human(size)).into());
+            window.set_iso_size(human(size).into());
             window.set_local_file(path.to_string_lossy().into_owned().into());
             window.set_iso_stage(2);
+            window.set_preparation_complete(false);
             window.set_selected_disk(-1);
             window.set_reuse_ventoy(false);
             window.set_status_text("ISO local cargada. Selecciona un USB para continuar.".into());
@@ -2281,7 +2361,8 @@ fn main() -> Result<(), slint::PlatformError> {
             if !begin(&state, &window) {
                 return;
             }
-            window.set_status_text("Buscando discos USB…".into());
+            window.set_usb_detecting(true);
+            window.set_status_text("Buscando unidades USB…".into());
             log_event("INFO etapa=detectar_usb inicio".into());
             let weak = weak.clone();
             let state = state.clone();
@@ -2297,6 +2378,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         w.set_reuse_ventoy(false);
                     });
                 }
+                ui(weak.clone(), |window| window.set_usb_detecting(false));
                 finish(
                     weak,
                     result.map(|d| format!("{} unidad(es) USB detectada(s)", d.len())),
@@ -2317,13 +2399,14 @@ fn main() -> Result<(), slint::PlatformError> {
                     .disks
                     .iter()
                     .find(|disk| disk.number == number as u32)
-                    .and_then(|disk| ventoy_data_letter(disk).ok())
+                    .and_then(|disk| ventoy_data_location(disk).ok())
                     .flatten()
                     .is_some()
             };
             if let Some(w) = weak.upgrade() {
                 w.set_selected_disk(number);
                 w.set_reuse_ventoy(reuse);
+                w.set_preparation_complete(false);
             }
         });
     }
@@ -2341,7 +2424,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(disk) = state.disks.iter().find(|d| d.number == number) else {
                 return;
             };
-            let reuse = match ventoy_data_letter(disk) {
+            let reuse = match ventoy_data_location(disk) {
                 Ok(letter) => letter.is_some(),
                 Err(error) => {
                     window.set_status_text(error.into());
@@ -2450,13 +2533,35 @@ fn main() -> Result<(), slint::PlatformError> {
                         window.set_success_detail(detail.into());
                         window.set_restart_message("".into());
                         window.set_restart_pending(false);
+                        window.set_preparation_complete(true);
+                        window.set_secure_boot_status(-2);
                         window.set_success_visible(true);
+                        let weak = window.as_weak();
+                        thread::spawn(move || {
+                            let detected = firmware_security_status();
+                            log_event(format!(
+                                "INFO etapa=seguridad_firmware_tras_preparar tpm={:?} secure_boot={:?}",
+                                detected.tpm, detected.secure_boot
+                            ));
+                            ui(weak, move |window| {
+                                window.set_tpm_status(detected.tpm.ui_value());
+                                window.set_secure_boot_status(detected.secure_boot.ui_value());
+                            });
+                        });
                     });
                 }
             });
         });
     }
 
+    {
+        let weak = window.as_weak();
+        Timer::single_shot(Duration::ZERO, move || {
+            if let Some(window) = weak.upgrade() {
+                window.invoke_refresh_usb();
+            }
+        });
+    }
     let result = window.run();
     log_event(format!(
         "INFO evento=cierre resultado={:?}",
@@ -2469,6 +2574,108 @@ fn main() -> Result<(), slint::PlatformError> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn alternative_link_is_read_from_release_notes() {
+        let plain = "https://drive.google.com/file/d/example/view?usp=sharing";
+        assert_eq!(alternative_link_from_notes(plain).unwrap().as_str(), plain);
+        let markdown = "Descarga: [ISO](https://example.org/new.iso?x=1&y=2).";
+        assert_eq!(
+            alternative_link_from_notes(markdown).unwrap().as_str(),
+            "https://example.org/new.iso?x=1&y=2"
+        );
+        assert!(alternative_link_from_notes("Solo http://example.org/file.iso").is_err());
+        assert!(alternative_link_from_notes("Sin enlace").is_err());
+        assert!(
+            alternative_link_from_notes("https://example.org/a https://example.org/b").is_err()
+        );
+    }
+
+    #[test]
+    fn iso_size_uses_binary_gib_like_windows_properties() {
+        assert_eq!(human(9_311_354_880), "8,67 GiB");
+        assert_eq!(human(1_048_576), "1,0 MiB");
+    }
+
+    #[test]
+    fn mirror_choices_only_include_available_named_servers() {
+        let html = r#"<li id="outside"></li><ul id="mirrorList">
+            <li id="autoselect"></li><li id="netix"></li>
+            <li id="master"></li><li id="netix"></li>
+            <li id="invalid.example"></li></ul>"#;
+        assert_eq!(
+            parse_mirror_choices(html),
+            vec!["netix".to_owned(), "master".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ranged_download_resumes_a_fragment_and_rejects_ignored_ranges() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for request_number in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let length = stream.read(&mut buffer).unwrap();
+                    assert!(length > 0);
+                    request.extend_from_slice(&buffer[..length]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                if request_number == 0 {
+                    assert!(request.contains("Range: bytes=16-127"));
+                    write!(
+                        stream,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 16-127/256\r\nContent-Length: 112\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    stream.write_all(&(16u8..64).collect::<Vec<_>>()).unwrap();
+                } else if request_number == 1 {
+                    assert!(request.contains("Range: bytes=64-127"));
+                    write!(
+                        stream,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 64-127/256\r\nContent-Length: 64\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    stream.write_all(&(64u8..128).collect::<Vec<_>>()).unwrap();
+                } else {
+                    assert!(request.contains("Range: bytes=16-127"));
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 256\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "winslim-range-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let url = format!("http://{address}/test.iso");
+        let progress = AtomicU64::new(0);
+        let abort = AtomicBool::new(false);
+        let state = AtomicU8::new(DOWNLOAD_RUNNING);
+        let good = dir.join("good.segment");
+        download_range(&url, &good, 16, 127, 256, &progress, &abort, &state).unwrap();
+        assert_eq!(fs::read(good).unwrap(), (16u8..128).collect::<Vec<_>>());
+        assert_eq!(progress.load(Ordering::Acquire), 112);
+        let bad = dir.join("bad.segment");
+        assert!(download_range(&url, &bad, 16, 127, 256, &progress, &abort, &state).is_err());
+        assert!(!bad.exists());
+        server.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn usb_action_requires_explicit_reinstall_and_matching_ventoy_state() {
@@ -2803,9 +3010,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn ventoy_is_reused_only_with_verified_data_and_boot_partitions() {
         let mut disk = Disk {
             number: 9,
+            device_path: None,
             friendly_name: "USB".into(),
             serial_number: Some("ABC".into()),
             size: 32_000_000_000,
@@ -2816,6 +3025,8 @@ mod tests {
             volumes: vec![
                 Volume {
                     letter: Some("M".into()),
+                    mount_path: None,
+                    device_path: None,
                     label: Some("Ventoy".into()),
                     file_system: Some("exFAT".into()),
                     size: 31_000_000_000,
@@ -2823,6 +3034,8 @@ mod tests {
                 },
                 Volume {
                     letter: None,
+                    mount_path: None,
+                    device_path: None,
                     label: Some("VTOYEFI".into()),
                     file_system: Some("FAT".into()),
                     size: 32 * 1024 * 1024,
@@ -2830,17 +3043,17 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(ventoy_data_letter(&disk).unwrap().as_deref(), Some("M"));
+        assert_eq!(ventoy_data_location(&disk).unwrap().as_deref(), Some("M"));
         disk.volumes[0].label = Some("WinSlim USB".into());
-        assert_eq!(ventoy_data_letter(&disk).unwrap().as_deref(), Some("M"));
+        assert_eq!(ventoy_data_location(&disk).unwrap().as_deref(), Some("M"));
         disk.volumes[0].file_system = Some("FAT32".into());
         disk.volumes[1].letter = Some("\0".into());
-        assert_eq!(ventoy_data_letter(&disk).unwrap().as_deref(), Some("M"));
+        assert_eq!(ventoy_data_location(&disk).unwrap().as_deref(), Some("M"));
         assert_eq!(disk_label(&disk).matches("M:").count(), 1);
         disk.volumes[1].label = None;
-        assert!(ventoy_data_letter(&disk).is_err());
+        assert!(ventoy_data_location(&disk).is_err());
         disk.volumes.clear();
-        assert!(ventoy_data_letter(&disk).unwrap().is_none());
+        assert!(ventoy_data_location(&disk).unwrap().is_none());
     }
 
     #[test]
@@ -2854,9 +3067,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn changed_usb_identity_is_rejected() {
         let disk = Disk {
             number: 2,
+            device_path: None,
             friendly_name: "USB".into(),
             serial_number: Some("A".into()),
             size: 16_000_000_000,
@@ -2873,14 +3088,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn free_space_check_uses_windows_api() {
         assert!(fs_free_bytes(&std::env::temp_dir()).unwrap() > 0);
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn local_iso_on_target_usb_is_rejected() {
         let disk = Disk {
             number: 5,
+            device_path: None,
             friendly_name: "USB".into(),
             serial_number: None,
             size: 32_000_000_000,
@@ -2890,6 +3108,8 @@ mod tests {
             is_read_only: false,
             volumes: vec![Volume {
                 letter: Some("E".into()),
+                mount_path: None,
+                device_path: None,
                 label: None,
                 file_system: Some("exFAT".into()),
                 size: 32_000_000_000,

@@ -12,36 +12,88 @@ export struct DiskRow {
 
 component ActionButton inherits Rectangle {
     in property <string> label;
+    in property <string> help-text: "";
+    in property <bool> help-align-right: false;
+    in property <bool> help-above: false;
+    in property <bool> help-detailed: false;
     in property <bool> enabled: true;
     in property <bool> primary: false;
+    in property <bool> quiet: false;
+    in property <bool> destructive: false;
     callback clicked;
     height: 40px;
-    border-radius: 9px;
-    background: !enabled ? #333333 : primary ? button-touch.pressed ? #cbd2da : button-touch.has-hover ? #ffffff : #e5e7eb : button-touch.pressed ? #484848 : button-touch.has-hover ? #3c3c3c : #303030;
-    border-color: !enabled ? #3d3d3d : primary ? #e5e7eb : button-touch.has-hover ? #848b95 : #535353;
+    border-radius: 11px;
+    background: !enabled ? #33333399 : primary ? button-touch.pressed ? #cecece : button-touch.has-hover ? #ffffff : #e5e5e5 : destructive ? button-touch.pressed ? #603138dd : button-touch.has-hover ? #4d2e33e8 : #352629dd : quiet ? button-touch.pressed ? #454545cc : button-touch.has-hover ? #383838cc : #2b2b2bbb : button-touch.pressed ? #505050e6 : button-touch.has-hover ? #404040dd : #303030cc;
+    border-color: !enabled ? #77777733 : primary ? #e5e5e5 : destructive ? button-touch.has-hover ? #c77882 : #87545a : quiet ? button-touch.has-hover ? #aaaaaa7a : #88888855 : button-touch.has-hover ? #bdbdbd99 : #aaaaaa66;
     border-width: 1px;
     animate background, border-color { duration: 120ms; }
     Text {
         text: root.label;
-        color: !root.enabled ? #898989 : root.primary ? #111111 : #f5f5f5;
+        color: !root.enabled ? #898989 : root.primary ? #111111 : root.destructive ? #f6bec4 : root.quiet ? #d0d0d0 : #f5f5f5;
         font-size: 14px;
         font-weight: 600;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-    button-touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+    button-touch := TouchArea {
+        changed has-hover => {
+            if (self.has-hover && root.help-text != "") {
+                help-delay.start();
+            } else {
+                help-delay.stop();
+                help-popup.close();
+            }
+        }
+        clicked => {
+            help-delay.stop();
+            help-popup.close();
+            if (root.enabled) { root.clicked(); }
+        }
+    }
+    help-delay := Timer {
+        interval: 2500ms;
+        running: false;
+        triggered() => {
+            self.stop();
+            if (button-touch.has-hover && root.help-text != "") { help-popup.show(); }
+        }
+    }
+    help-popup := PopupWindow {
+        x: root.help-align-right ? root.width - self.width : 0px;
+        y: root.help-above ? -self.height - 8px : root.height + 8px;
+        width: root.help-detailed ? 380px : max(250px, min(340px, root.width));
+        height: root.help-detailed ? 110px : 84px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            border-radius: 11px;
+            background: #252525;
+            border-color: #898989;
+            border-width: 1px;
+            Text {
+                x: 12px; y: 8px;
+                width: parent.width - 24px; height: parent.height - 16px;
+                text: root.help-text;
+                color: #f0f0f0;
+                font-size: 14px;
+                font-weight: 700;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+        }
+    }
 }
 
 component RoundedSelect inherits Rectangle {
     in property <[string]> options;
     in property <int> current-index: 0;
     in property <bool> enabled: true;
+    in property <string> help-text: "";
     callback selected(int);
 
     height: 40px;
-    border-radius: 9px;
-    background: !root.enabled ? #333333 : select-touch.pressed ? #484848 : select-touch.has-hover ? #3c3c3c : #303030;
-    border-color: !root.enabled ? #3d3d3d : select-touch.has-hover ? #848b95 : #535353;
+    border-radius: 11px;
+    background: !root.enabled ? #33333399 : select-touch.pressed ? #505050e6 : select-touch.has-hover ? #404040dd : #303030cc;
+    border-color: !root.enabled ? #77777733 : select-touch.has-hover ? #bdbdbd99 : #aaaaaa66;
     border-width: 1px;
     animate background, border-color { duration: 120ms; }
 
@@ -68,26 +120,69 @@ component RoundedSelect inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-    select-touch := TouchArea { enabled: root.enabled; clicked => { menu.show(); } }
+    select-touch := TouchArea {
+        changed has-hover => {
+            if (self.has-hover && root.help-text != "") {
+                help-delay.start();
+            } else {
+                help-delay.stop();
+                help-popup.close();
+            }
+        }
+        clicked => {
+            help-delay.stop();
+            help-popup.close();
+            if (root.enabled) { menu.show(); }
+        }
+    }
+    help-delay := Timer {
+        interval: 2500ms;
+        running: false;
+        triggered() => {
+            self.stop();
+            if (select-touch.has-hover && root.help-text != "") { help-popup.show(); }
+        }
+    }
+    help-popup := PopupWindow {
+        x: 0px; y: -self.height - 8px;
+        width: 285px; height: 80px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            border-radius: 11px;
+            background: #252525;
+            border-color: #898989;
+            border-width: 1px;
+            Text {
+                x: 12px; y: 8px;
+                width: parent.width - 24px; height: parent.height - 16px;
+                text: root.help-text;
+                color: #f0f0f0;
+                font-size: 14px;
+                font-weight: 700;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+        }
+    }
 
     menu := PopupWindow {
         x: 0px;
-        y: root.height + 4px;
+        y: root.height + 8px;
         width: root.width;
-        height: root.options.length * 40px + 8px;
+        height: root.options.length * 48px + 4px;
         close-policy: close-on-click-outside;
         Rectangle {
             border-radius: 9px;
-            background: #303030;
-            border-color: #5a5a5a;
+            background: #282828f5;
+            border-color: #aaaaaa66;
             border-width: 1px;
             VerticalLayout {
-                padding: 4px;
-                spacing: 0px;
+                padding: 6px;
+                spacing: 8px;
                 for option[index] in root.options : Rectangle {
                     height: 40px;
                     border-radius: 6px;
-                    background: option-touch.pressed ? #585858 : option-touch.has-hover ? #4b4b4b : index == root.current-index ? #454545 : #303030;
+                    background: option-touch.pressed ? #595959e8 : option-touch.has-hover ? #4b4b4be8 : index == root.current-index ? #454545dc : #303030d6;
                     animate background { duration: 100ms; }
                     Text {
                         x: 9px;
@@ -112,27 +207,93 @@ component RoundedSelect inherits Rectangle {
     }
 }
 
+component FormatSelect inherits Rectangle {
+    in property <string> caption;
+    in property <string> help-text;
+    in property <[string]> options;
+    in property <int> current-index: 0;
+    in property <bool> enabled: true;
+    callback selected(int);
+
+    height: 64px;
+    background: transparent;
+    Text {
+        text: root.caption;
+        x: 0px; y: 0px;
+        width: parent.width; height: 16px;
+        color: #c2c2c2;
+        font-size: 12px;
+        font-weight: 700;
+    }
+    RoundedSelect {
+        x: 0px; y: 24px;
+        width: parent.width;
+        options: root.options;
+        current-index: root.current-index;
+        enabled: root.enabled;
+        help-text: root.help-text;
+        selected(index) => { root.selected(index); }
+    }
+}
+
+component StepBadge inherits Rectangle {
+    in property <string> number;
+    in property <bool> current: false;
+    in property <bool> done: false;
+
+    width: 28px;
+    height: 28px;
+    border-radius: 14px;
+    background: current ? #e8e8e8 : done ? #20402cee : #252525d6;
+    border-color: current ? #ffffff : done ? #71d995c4 : #77777770;
+    border-width: 1px;
+    clip: true;
+    animate background, border-color { duration: 180ms; }
+    if root.done : Rectangle {
+        x: 3px; y: 2px;
+        width: 22px; height: 9px;
+        border-radius: 5px;
+        background: #ffffff1c;
+    }
+    Text {
+        text: root.done ? "✓" : root.number;
+        color: root.current ? #171717 : root.done ? #b5f0c4 : #b7b7b7;
+        font-size: root.done ? 16px : 12px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
 export component MainWindow inherits Window {
     title: "WinSlim USB Creator";
     icon: @image-url("../assets/icon.png");
     preferred-width: 1200px;
-    preferred-height: 985px;
+    preferred-height: 1040px;
     min-width: 680px;
     min-height: 530px;
     // Cambiar este color un nivel invalida toda la superficie tras restaurar la ventana.
-    background: redraw-flip ? #1b1b1c : #1b1b1b;
+    background: redraw-flip ? #101011 : #101010;
     default-font-family: "Ubuntu Sans";
 
     in-out property <bool> redraw-flip: false;
 
     in-out property <string> iso-name: "Ninguna ISO seleccionada";
-    in-out property <string> iso-detail: "SourceForge · WinSlim11_ISOS";
+    in-out property <string> iso-size: "";
+    // -1: descarga no disponible; 0: comprobando; 1: ISO accesible.
+    in-out property <int> server-availability: 0;
     in-out property <string> local-file: "Sin descargar";
     in-out property <string> status-text: "Listo";
+    // -2: comprobando; -1: no se pudo comprobar; 0: deshabilitado; 1: habilitado.
+    in-out property <int> tpm-status: -2;
+    in-out property <int> secure-boot-status: -2;
     in-out property <float> progress: 0;
     in-out property <bool> busy: false;
+    in-out property <bool> usb-detecting: false;
     // 0: sin ISO; 1: ISO localizada en el servidor; 2: ISO local; 3: ISO descargada.
     in-out property <int> iso-stage: 0;
+    in-out property <bool> preparation-complete: false;
+    private property <int> active-step: root.preparation-complete ? 4 : root.iso-stage < 2 ? 1 : root.selected-disk < 0 ? 2 : 3;
     in-out property <bool> download-active: false;
     in-out property <bool> download-cancelling: false;
     in-out property <bool> confirm-visible: false;
@@ -148,11 +309,13 @@ export component MainWindow inherits Window {
     in-out property <bool> success-visible: false;
     in-out property <string> success-detail: "";
     in-out property <string> restart-message: "";
+    in-out property <string> restart-instructions: "";
     in-out property <bool> restart-pending: false;
     in-out property <image> success-backdrop;
 
     callback lookup-iso();
     callback download-iso();
+    callback download-alternative-iso();
     callback download-latest-iso();
     callback cancel-download();
     callback load-local-iso();
@@ -172,34 +335,57 @@ export component MainWindow inherits Window {
     callback restart-to-usb();
 
     VerticalLayout {
+        width: parent.width;
+        height: parent.height;
         spacing: 0px;
         header := Rectangle {
             height: 64px;
-            background: #151515;
-            border-color: #303030;
+            background: @linear-gradient(180deg, #1f1f1fe8 0%, #151515e8 55%, #0c0c0cf0 100%);
+            border-color: #a0a0a05e;
             border-width: 1px;
-            Image {
-                source: @image-url("../assets/icon.png");
-                x: 20px; y: 12px;
-                width: 40px; height: 40px;
-                image-fit: contain;
+            Rectangle {
+                x: (header.width - self.width) / 2;
+                width: 540px;
+                height: header.height;
+                background: @radial-gradient(circle 270px, #ffffff13 0%, #ffffff00 100%);
             }
-            Text {
-                text: "WinSlim USB Creator";
-                x: 70px; y: 0px;
-                width: header.width - 140px; height: header.height;
-                color: #f8f8f8;
-                font-size: 18px;
-                font-weight: 700;
-                vertical-alignment: center;
-                overflow: elide;
+            if header.width >= 900px : Rectangle {
+                x: 34px; y: 31px;
+                width: header.width / 2 - 260px; height: 1px;
+                background: @linear-gradient(90deg, #d0d0d000 0%, #d0d0d03d 100%);
+            }
+            if header.width >= 900px : Rectangle {
+                x: header.width / 2 + 220px; y: 31px;
+                width: header.width / 2 - 300px; height: 1px;
+                background: @linear-gradient(90deg, #d0d0d03d 0%, #d0d0d000 100%);
+            }
+            brand := Rectangle {
+                x: (header.width - self.width) / 2;
+                width: 300px; height: header.height;
+                background: transparent;
+                Image {
+                    source: @image-url("../assets/icon-header-40.png");
+                    x: 0px; y: 12px;
+                    width: 40px; height: 40px;
+                    image-fit: contain;
+                }
+                Text {
+                    text: "WinSlim USB Creator";
+                    x: 50px; y: 0px;
+                    width: 250px; height: parent.height;
+                    color: #f8f8f8;
+                    font-size: 24px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
             }
             log-button := Rectangle {
                 x: header.width - 58px; y: 13px;
                 width: 38px; height: 38px;
-                border-radius: 9px;
-                background: log-touch.pressed ? #484848 : log-touch.has-hover ? #3c3c3c : #303030;
-                border-color: log-touch.has-hover ? #848b95 : #5a5a5a;
+                border-radius: 11px;
+                background: log-touch.pressed ? #505050e6 : log-touch.has-hover ? #404040dd : #303030cc;
+                border-color: log-touch.has-hover ? #bdbdbd99 : #aaaaaa66;
                 border-width: 1px;
                 animate background, border-color { duration: 120ms; }
                 // Hoja con líneas: acceso al registro de actividad.
@@ -214,96 +400,308 @@ export component MainWindow inherits Window {
                     Rectangle { x: 3px; y: 10px; width: 8px; height: 2px; background: #f5f5f5; }
                     Rectangle { x: 3px; y: 15px; width: 6px; height: 2px; background: #f5f5f5; }
                 }
-                log-touch := TouchArea { clicked => { root.show-logs(); } }
+                log-touch := TouchArea {
+                    changed has-hover => {
+                        if (self.has-hover) { log-help-delay.start(); }
+                        else { log-help-delay.stop(); log-help-popup.close(); }
+                    }
+                    clicked => { log-help-delay.stop(); log-help-popup.close(); root.show-logs(); }
+                }
+                log-help-delay := Timer {
+                    interval: 2500ms; running: false;
+                    triggered() => { self.stop(); if (log-touch.has-hover) { log-help-popup.show(); } }
+                }
+                log-help-popup := PopupWindow {
+                    x: log-button.width - self.width; y: log-button.height + 8px;
+                    width: 280px; height: 80px;
+                    close-policy: close-on-click-outside;
+                    Rectangle {
+                        border-radius: 11px; background: #252525;
+                        border-color: #898989; border-width: 1px;
+                        Text {
+                            x: 12px; y: 8px; width: parent.width - 24px; height: parent.height - 16px;
+                            text: "Muestra la actividad de la aplicación y los detalles de posibles errores.";
+                            color: #f0f0f0; font-size: 14px; font-weight: 700; wrap: word-wrap; vertical-alignment: center;
+                        }
+                    }
+                }
             }
         }
 
         ScrollView {
             VerticalLayout {
-                padding: 22px;
+                padding: 20px;
                 spacing: 18px;
-                Text { text: "Prepara tu USB de WinSlim"; color: #f7f7f7; font-size: 28px; font-weight: 700; }
-                Text { text: "Descarga la versión más reciente o selecciona una imagen ISO local para crear una unidad de arranque e instalación en solo unos pasos."; color: #b6bcc7; font-size: 14px; }
+                intro := Rectangle {
+                    height: 98px;
+                    border-radius: 14px;
+                    background: transparent;
+                    border-color: #c0c0c080;
+                    border-width: 1px;
+                    clip: true;
+                    Rectangle {
+                        x: 1px; y: 1px;
+                        width: parent.width - 2px; height: parent.height - 2px;
+                        border-radius: 13px;
+                        background: #222222;
+                    }
+                    Text {
+                        x: 20px; y: 11px;
+                        width: parent.width - 40px; height: 36px;
+                        text: "Prepara tu USB de WinSlim";
+                        color: #f7f7f7; font-size: 28px; font-weight: 700;
+                    }
+                    Text {
+                        x: 20px; y: 53px;
+                        width: parent.width - 40px;
+                        height: 36px;
+                        text: "Descarga la versión más reciente o selecciona una imagen ISO local para crear una unidad de arranque e instalación en solo unos pasos.";
+                        color: #b6bcc7; font-size: 15px; font-weight: 700; wrap: word-wrap;
+                    }
+                }
 
                 Rectangle {
-                    height: 205px;
-                    border-radius: 12px;
-                    background: #242424;
-                    border-color: #454545;
-                    border-width: 1px;
+                    height: root.download-active ? 220px : root.iso-stage == 2 ? (root.width < 900px ? 270px : 260px) : root.iso-stage == 1 ? (root.width >= 1020px ? 235px : 278px) : root.iso-stage == 3 ? 235px : 220px;
+                    border-radius: 14px;
+                    background: root.active-step == 1 ? #202020ee : root.active-step > 1 ? #191919e8 : #161616e6;
+                    border-color: root.active-step == 1 ? #d8d8d8ae : root.active-step > 1 ? #99999970 : #77777755;
+                    border-width: root.active-step == 1 ? 2px : 1px;
+                    animate background, border-color { duration: 180ms; }
+                    Rectangle {
+                        x: 14px; y: 1px;
+                        width: parent.width - 28px; height: 1px;
+                        background: root.active-step == 1 ? #ffffff36 : #ffffff1c;
+                    }
                     VerticalLayout {
                         padding: 17px;
-                        spacing: 8px;
-                        Text { text: "01   Selecciona de dónde cargas la imagen:"; color: #b9c0cc; font-size: 12px; font-weight: 700; }
+                        spacing: 10px;
+                        HorizontalLayout {
+                            height: 28px;
+                            spacing: 10px;
+                            StepBadge { number: "01"; current: root.active-step == 1; done: root.active-step > 1; }
+                            Text { text: "Selecciona de dónde cargas la imagen:"; color: #f0f2f5; font-size: 16px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
+                        }
                         Text {
                             text: root.download-active
                                 ? "Buscando o descargando la ISO. Puedes cancelar el proceso en cualquier momento."
                                 : root.iso-stage == 1
-                                ? "La última ISO está localizada. Descárgala o selecciona una imagen local."
+                                ? "La última ISO está localizada. Descárgala en la aplicación o abre la alternativa en el navegador."
                                 : root.iso-stage == 2
-                                ? "La ISO local está lista. Puedes cambiarla o descargar la última versión desde el servidor."
+                                ? "La ISO local está lista para el paso 02. Puedes cambiarla o descargar la última versión."
                                 : root.iso-stage == 3
-                                ? "La ISO descargada está lista. Puedes buscar una versión más reciente o cargar otra imagen local."
+                                ? "La ISO descargada está lista para el paso 02. Puedes buscar otra versión o cargar una imagen local."
                                 : "Selecciona «Buscar última ISO de WinSlim en línea» para consultar la versión más reciente, o «Cargar ISO local» para elegir una imagen de tu equipo.";
                             color: #b9c0cc;
-                            font-size: 13px;
+                            font-size: 14px;
+                            font-weight: 700;
                             wrap: word-wrap;
                         }
-                        Text { text: root.iso-name; color: #ffffff; font-size: 17px; font-weight: 600; overflow: elide; }
-                        Text { text: root.iso-detail; color: #afb4bd; font-size: 13px; }
                         HorizontalLayout {
+                            height: 26px;
+                            spacing: 10px;
+                            Text {
+                                text: root.iso-name;
+                                color: #ffffff;
+                                font-size: 17px;
+                                font-weight: 600;
+                                max-width: 460px;
+                                horizontal-stretch: 0;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            if root.iso-size != "" : Rectangle {
+                                width: 96px; height: 26px;
+                                border-radius: 13px;
+                                background: #303030e8;
+                                border-color: #a0a0a078;
+                                border-width: 1px;
+                                Text {
+                                    text: root.iso-size;
+                                    color: #dedede;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                        }
+                        HorizontalLayout {
+                            height: 20px;
+                            spacing: 8px;
+                            Rectangle {
+                                width: 10px; height: 20px; background: transparent;
+                                Rectangle {
+                                    y: 5px; width: 10px; height: 10px; border-radius: 5px;
+                                    background: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #51cc79 : root.server-availability == -1 ? #e56868 : #aab3be;
+                                }
+                            }
+                            Text {
+                                text: root.iso-stage == 2 && !root.download-active ? "ISO local cargada" : root.server-availability == 1 ? "Servidor en línea · Última ISO de WinSlim disponible para descargar" : root.server-availability == -1 ? "Descarga no disponible" : "Comprobando disponibilidad de la ISO…";
+                                color: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #9be4ae : root.server-availability == -1 ? #f0a4a4 : #afb4bd;
+                                font-size: 14px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                        }
+                        if root.iso-stage == 2 && !root.download-active : Text {
+                            text: "Ruta de origen: " + root.local-file;
+                            color: #afb4bd;
+                            font-size: 14px;
+                            wrap: word-wrap;
+                            vertical-stretch: 0;
+                        }
+                        if root.download-active || root.iso-stage != 1 : HorizontalLayout {
                             spacing: 10px;
                             if root.download-active : ActionButton {
                                 label: root.download-cancelling ? "Cancelando…" : "Cancelar descarga";
+                                help-text: "Detiene la descarga y elimina el archivo incompleto.";
                                 width: 175px;
+                                destructive: true;
                                 enabled: !root.download-cancelling;
                                 clicked => { root.cancel-download(); }
                             }
                             if !root.download-active && root.iso-stage != 2 : ActionButton {
                                 label: "Buscar última ISO de WinSlim en línea";
+                                help-text: "Busca la versión más reciente de WinSlim disponible para descargar.";
                                 width: 280px;
+                                primary: root.iso-stage == 0;
+                                quiet: root.iso-stage == 3;
                                 enabled: !root.busy;
                                 clicked => { root.lookup-iso(); }
                             }
-                            if !root.download-active && root.iso-stage == 1 : ActionButton {
-                                label: "Descargar ISO";
-                                width: 130px;
+                            if !root.download-active && root.iso-stage == 2 : ActionButton {
+                                label: "Descargar última ISO";
+                                help-text: "Busca y descarga la última ISO. La imagen local seguirá disponible durante la descarga.";
+                                width: 185px;
+                                primary: true;
+                                enabled: !root.busy;
+                                clicked => { root.download-latest-iso(); }
+                            }
+                            if !root.download-active : ActionButton {
+                                label: root.iso-stage == 2 || root.iso-stage == 3 ? "Cambiar ISO local" : "Cargar ISO local";
+                                help-text: "Abre el explorador para elegir una ISO guardada en el equipo.";
+                                width: 150px;
+                                quiet: root.iso-stage >= 2;
+                                enabled: !root.busy;
+                                clicked => { root.load-local-iso(); }
+                            }
+                        }
+                        if !root.download-active && root.iso-stage == 1 && root.width >= 1020px : HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton {
+                                label: "Descarga directa de la ISO";
+                                help-text: "Descarga automáticamente la versión más reciente de la ISO desde la aplicación. Una vez completada la descarga, la ISO se cargará y quedará lista para continuar.";
+                                help-detailed: true;
+                                min-width: 210px;
+                                horizontal-stretch: 1;
                                 primary: true;
                                 enabled: !root.busy;
                                 clicked => { root.download-iso(); }
                             }
-                            if !root.download-active : ActionButton {
-                                label: root.iso-stage == 2 || root.iso-stage == 3 ? "Cambiar ISO local" : "Cargar ISO local";
-                                width: 150px;
+                            ActionButton {
+                                label: "Descarga alternativa de la ISO";
+                                help-text: "Abre en el navegador una opción alternativa para descargar la ISO.";
+                                min-width: 240px;
+                                horizontal-stretch: 1;
+                                enabled: !root.busy;
+                                clicked => { root.download-alternative-iso(); }
+                            }
+                            ActionButton {
+                                label: "Volver a buscar la última ISO";
+                                help-text: "Comprueba de nuevo si hay una versión más reciente de la ISO.";
+                                min-width: 255px;
+                                horizontal-stretch: 1;
+                                quiet: true;
+                                enabled: !root.busy;
+                                clicked => { root.lookup-iso(); }
+                            }
+                            ActionButton {
+                                label: "Cargar ISO local";
+                                help-text: "Elige una ISO que ya esté guardada en el equipo.";
+                                help-align-right: true;
+                                min-width: 175px;
+                                horizontal-stretch: 1;
+                                quiet: true;
                                 enabled: !root.busy;
                                 clicked => { root.load-local-iso(); }
                             }
-                            if !root.download-active && root.iso-stage == 2 : ActionButton {
-                                label: "Descargar última ISO";
-                                width: 185px;
+                        }
+                        if !root.download-active && root.iso-stage == 1 && root.width < 1020px : HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton {
+                                label: "Descarga directa de la ISO";
+                                help-text: "Descarga automáticamente la versión más reciente de la ISO desde la aplicación. Una vez completada la descarga, la ISO se cargará y quedará lista para continuar.";
+                                help-detailed: true;
+                                min-width: 210px;
+                                horizontal-stretch: 1;
+                                primary: true;
                                 enabled: !root.busy;
-                                clicked => { root.download-latest-iso(); }
+                                clicked => { root.download-iso(); }
+                            }
+                            ActionButton {
+                                label: "Descarga alternativa de la ISO";
+                                help-text: "Abre en el navegador una opción alternativa para descargar la ISO.";
+                                help-align-right: true;
+                                min-width: 240px;
+                                horizontal-stretch: 1;
+                                enabled: !root.busy;
+                                clicked => { root.download-alternative-iso(); }
+                            }
+                        }
+                        if !root.download-active && root.iso-stage == 1 && root.width < 1020px : HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton {
+                                label: "Volver a buscar la última ISO";
+                                help-text: "Comprueba de nuevo si hay una versión más reciente de la ISO.";
+                                min-width: 255px;
+                                horizontal-stretch: 1;
+                                quiet: true;
+                                enabled: !root.busy;
+                                clicked => { root.lookup-iso(); }
+                            }
+                            ActionButton {
+                                label: "Cargar ISO local";
+                                help-text: "Elige una ISO que ya esté guardada en el equipo.";
+                                help-align-right: true;
+                                min-width: 175px;
+                                horizontal-stretch: 1;
+                                quiet: true;
+                                enabled: !root.busy;
+                                clicked => { root.load-local-iso(); }
                             }
                         }
                     }
                 }
 
                 Rectangle {
-                    height: 300px;
-                    border-radius: 12px;
-                    background: #242424;
-                    border-color: #454545;
-                    border-width: 1px;
+                    height: root.reuse-ventoy ? (root.height >= 1030px ? 245px : 215px) : root.height >= 1030px ? 290px : 245px;
+                    border-radius: 14px;
+                    background: root.active-step == 2 ? #202020ee : root.active-step > 2 ? #191919e8 : #161616e6;
+                    border-color: root.active-step == 2 ? #d8d8d8ae : root.active-step > 2 ? #99999970 : #77777755;
+                    border-width: root.active-step == 2 ? 2px : 1px;
+                    animate background, border-color { duration: 180ms; }
+                    Rectangle {
+                        x: 14px; y: 1px;
+                        width: parent.width - 28px; height: 1px;
+                        background: root.active-step == 2 ? #ffffff36 : #ffffff1c;
+                    }
                     VerticalLayout {
                         padding: 17px;
                         spacing: 9px;
                         HorizontalLayout {
-                            Text { text: "02   Selecciona la unidad USB en la que prepararemos la instalación de la ISO de WinSlim."; color: #b9c0cc; font-size: 12px; font-weight: 700; wrap: word-wrap; }
-                            Rectangle { horizontal-stretch: 1; background: transparent; }
-                            ActionButton { label: "Detectar unidades"; width: 154px; enabled: !root.busy; clicked => { root.refresh-usb(); } }
+                            spacing: 12px;
+                            Rectangle {
+                                width: 28px; height: 40px; background: transparent;
+                                StepBadge { y: 6px; number: "02"; current: root.active-step == 2; done: root.active-step > 2; }
+                            }
+                            Text { text: "Selecciona la unidad USB en la que prepararemos la instalación de la ISO de WinSlim."; color: #f0f2f5; font-size: 16px; font-weight: 700; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1; }
+                            ActionButton { label: "Volver a detectar unidades"; help-text: "Vuelve a buscar las unidades USB conectadas y actualiza la lista."; help-align-right: true; width: 220px; enabled: !root.busy; clicked => { root.refresh-usb(); } }
                         }
-                        Text { text: root.disks.length == 0 ? "No se detectaron unidades USB" : root.reuse-ventoy ? "Ventoy detectado: puedes copiar sin borrar o formatear la unidad de nuevo" : "Selecciona la unidad que se borrará"; color: #afb4bd; font-size: 13px; }
+                        Text { text: root.usb-detecting ? "Buscando unidades USB…" : root.disks.length == 0 ? "No se detectaron unidades USB" : root.reuse-ventoy ? "Ventoy detectado: puedes copiar sin borrar o formatear la unidad de nuevo" : "La unidad seleccionada se formateará y perderá todo su contenido."; color: #afb4bd; font-size: 14px; font-weight: 700; }
                         HorizontalLayout {
+                            padding-top: 6px;
                             spacing: 12px;
                             disk-scroll := ScrollView {
                                 vertical-scrollbar-policy: always-off;
@@ -312,9 +710,9 @@ export component MainWindow inherits Window {
                                     spacing: 9px;
                                     for disk in root.disks : Rectangle {
                                         height: 74px;
-                                        border-radius: 8px;
-                                        background: root.selected-disk == disk.number ? disk-touch.has-hover && !root.busy ? #505050 : #414141 : disk-touch.has-hover && !root.busy ? #393939 : #2e2e2e;
-                                        border-color: root.selected-disk == disk.number ? #d5d8dc : disk-touch.has-hover && !root.busy ? #848b95 : #494949;
+                                        border-radius: 10px;
+                                        background: root.selected-disk == disk.number ? disk-touch.has-hover && !root.busy ? #515151e8 : #414141e2 : disk-touch.has-hover && !root.busy ? #393939e0 : #2e2e2ed6;
+                                        border-color: root.selected-disk == disk.number ? #d5d5d5 : disk-touch.has-hover && !root.busy ? #bdbdbd99 : #aaaaaa45;
                                         border-width: 1px;
                                         animate background, border-color { duration: 120ms; }
                                         VerticalLayout {
@@ -334,7 +732,7 @@ export component MainWindow inherits Window {
                                 width: 12px;
                                 visible: disk-scroll.content-height > disk-scroll.visible-height;
                                 border-radius: 6px;
-                                background: #303030;
+                                background: #303030dd;
                                 thumb := Rectangle {
                                     x: 3px;
                                     width: 6px;
@@ -376,65 +774,119 @@ export component MainWindow inherits Window {
                 }
 
                 Rectangle {
-                    height: root.reuse-ventoy ? 190px : 132px;
-                    border-radius: 12px;
-                    background: #242424;
-                    border-color: #454545;
-                    border-width: 1px;
+                    height: root.reuse-ventoy ? (root.width < 900px ? 216px : 190px) : (root.width < 900px ? 160px : 140px);
+                    border-radius: 14px;
+                    background: root.active-step == 3 ? #202020ee : root.active-step > 3 ? #191919e8 : #161616e6;
+                    border-color: root.active-step == 3 ? #d8d8d8ae : root.active-step > 3 ? #99999970 : #77777755;
+                    border-width: root.active-step == 3 ? 2px : 1px;
+                    animate background, border-color { duration: 180ms; }
+                    Rectangle {
+                        x: 14px; y: 1px;
+                        width: parent.width - 28px; height: 1px;
+                        background: root.active-step == 3 ? #ffffff36 : #ffffff1c;
+                    }
                     VerticalLayout {
-                        padding: 17px;
-                        spacing: 12px;
-                        Text {
-                            text: root.reuse-ventoy
-                                ? "03   Copia la ISO sin borrar los archivos, o formatea y prepara de nuevo la unidad con el formato seleccionado."
-                                : "03   Elige el formato de la unidad y pulsa «Preparar USB» para instalar Ventoy y copiar la ISO.";
-                            color: #b9c0cc;
-                            font-size: 12px;
-                            font-weight: 700;
-                            wrap: word-wrap;
+                        padding-left: 17px;
+                        padding-right: 17px;
+                        padding-top: 14px;
+                        padding-bottom: 14px;
+                        spacing: 16px;
+                        HorizontalLayout {
+                            height: root.width < 900px ? 42px : 28px;
+                            spacing: 10px;
+                            StepBadge { number: "03"; current: root.active-step == 3; done: root.active-step > 3; }
+                            Text {
+                                text: root.preparation-complete
+                                    ? "USB preparado. Puedes cerrar la aplicación o iniciar desde la unidad."
+                                    : root.reuse-ventoy
+                                    ? "Copia la ISO sin borrar los archivos, o formatea y prepara de nuevo la unidad con el formato seleccionado."
+                                    : "Elige el formato de la unidad y pulsa «Preparar USB» para instalar Ventoy y copiar la ISO.";
+                                color: #f0f2f5;
+                                font-size: 16px;
+                                font-weight: 700;
+                                wrap: word-wrap;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
                         }
                         if !root.reuse-ventoy : HorizontalLayout {
-                            spacing: 12px;
-                            RoundedSelect { options: ["MBR (recomendado)", "GPT"]; current-index: root.gpt ? 1 : 0; width: 175px; enabled: !root.busy; selected(index) => { root.gpt = index == 1; } }
-                            RoundedSelect { options: ["exFAT (recomendado)", "NTFS"]; current-index: root.ntfs ? 1 : 0; width: 195px; enabled: !root.busy; selected(index) => { root.ntfs = index == 1; } }
+                            height: 64px;
+                            spacing: 20px;
+                            FormatSelect { caption: "Esquema de partición"; help-text: "Elige cómo se organiza el arranque del USB. MBR funciona en más equipos."; options: ["MBR (recomendado)", "GPT"]; current-index: root.gpt ? 1 : 0; width: 175px; enabled: !root.busy; selected(index) => { root.gpt = index == 1; } }
+                            FormatSelect { caption: "Sistema de archivos"; help-text: "Elige el formato de almacenamiento del USB. exFAT funciona con más sistemas."; options: ["exFAT (recomendado)", "NTFS"]; current-index: root.ntfs ? 1 : 0; width: 195px; enabled: !root.busy; selected(index) => { root.ntfs = index == 1; } }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
-                            ActionButton { label: "Preparar USB"; width: 156px; primary: true; enabled: !root.busy && root.selected-disk >= 0 && root.iso-stage >= 2; clicked => { root.request-prepare(false); } }
+                            Rectangle {
+                                width: 156px; background: transparent;
+                                ActionButton { y: 24px; width: parent.width; label: "Preparar USB"; help-text: "Prepara el USB para arrancar y copia la ISO elegida. Se borrarán los archivos de la unidad."; help-align-right: true; help-above: true; primary: true; enabled: !root.busy && root.selected-disk >= 0 && root.iso-stage >= 2; clicked => { root.request-prepare(false); } }
+                            }
                         }
                         if root.reuse-ventoy : VerticalLayout {
-                            spacing: 12px;
+                            vertical-stretch: 0;
+                            spacing: 10px;
                             HorizontalLayout {
-                                spacing: 12px;
-                                RoundedSelect { options: ["MBR (recomendado)", "GPT"]; current-index: root.gpt ? 1 : 0; width: 175px; enabled: !root.busy; selected(index) => { root.gpt = index == 1; } }
-                                RoundedSelect { options: ["exFAT (recomendado)", "NTFS"]; current-index: root.ntfs ? 1 : 0; width: 195px; enabled: !root.busy; selected(index) => { root.ntfs = index == 1; } }
+                                height: 64px;
+                                spacing: 20px;
+                                FormatSelect { caption: "Esquema de partición"; help-text: "Elige cómo se organiza el arranque del USB. MBR funciona en más equipos."; options: ["MBR (recomendado)", "GPT"]; current-index: root.gpt ? 1 : 0; width: 175px; enabled: !root.busy; selected(index) => { root.gpt = index == 1; } }
+                                FormatSelect { caption: "Sistema de archivos"; help-text: "Elige el formato para preparar de nuevo el USB. exFAT funciona con más sistemas."; options: ["exFAT (recomendado)", "NTFS"]; current-index: root.ntfs ? 1 : 0; width: 195px; enabled: !root.busy; selected(index) => { root.ntfs = index == 1; } }
                             }
                             HorizontalLayout {
+                                height: 40px;
                                 spacing: 12px;
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
-                                ActionButton { label: "Copiar ISO al USB seleccionado"; width: 245px; primary: true; enabled: !root.busy && root.selected-disk >= 0 && root.iso-stage >= 2; clicked => { root.request-prepare(false); } }
-                                ActionButton { label: "Formatear y preparar de nuevo"; width: 255px; enabled: !root.busy && root.selected-disk >= 0 && root.iso-stage >= 2; clicked => { root.request-prepare(true); } }
+                                ActionButton { label: "Copiar ISO al USB seleccionado"; help-text: "Copia la ISO al USB sin borrar los demás archivos de la unidad."; help-above: true; width: 245px; primary: true; enabled: !root.busy && root.selected-disk >= 0 && root.iso-stage >= 2; clicked => { root.request-prepare(false); } }
+                                ActionButton { label: "Formatear y preparar de nuevo"; help-text: "Borra el USB, vuelve a prepararlo para arrancar y copia la ISO elegida."; help-align-right: true; help-above: true; width: 255px; enabled: !root.busy && root.selected-disk >= 0 && root.iso-stage >= 2; clicked => { root.request-prepare(true); } }
                             }
                         }
                     }
                 }
+                Rectangle { vertical-stretch: 1; background: transparent; }
             }
         }
 
         Rectangle {
-            height: 78px;
-            background: #222222;
-            border-color: #3c3c3c;
+            height: 92px;
+            background: #222222cc;
+            border-color: #a0a0a05e;
             border-width: 1px;
             VerticalLayout {
                 padding-left: 22px;
                 padding-right: 22px;
-                padding-top: 12px;
-                padding-bottom: 14px;
-                spacing: 11px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 7px;
                 Text { text: root.status-text; color: #f1f3f6; font-size: 16px; font-weight: 700; overflow: elide; }
+                HorizontalLayout {
+                    height: 18px;
+                    spacing: 6px;
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Rectangle {
+                        width: 9px; height: 18px; background: transparent;
+                        Rectangle {
+                            y: 5px; width: 8px; height: 8px; border-radius: 4px;
+                            background: root.tpm-status == 1 ? #51cc79 : root.tpm-status == 0 ? #e7a34f : #9d9d9d;
+                        }
+                    }
+                    Text {
+                        text: root.tpm-status == 1 ? "TPM: Habilitado" : root.tpm-status == 0 ? "TPM: Deshabilitado / no disponible" : root.tpm-status == -2 ? "TPM: Comprobando…" : "TPM: No se pudo comprobar";
+                        color: #d0d0d0; font-size: 13px; vertical-alignment: center; horizontal-stretch: 0;
+                    }
+                    Rectangle { width: 12px; background: transparent; }
+                    Rectangle {
+                        width: 9px; height: 18px; background: transparent;
+                        Rectangle {
+                            y: 5px; width: 8px; height: 8px; border-radius: 4px;
+                            background: root.secure-boot-status == 1 ? #e56868 : root.secure-boot-status == 0 ? #51cc79 : #9d9d9d;
+                        }
+                    }
+                    Text {
+                        text: root.secure-boot-status == 1 ? "Secure Boot: Habilitado" : root.secure-boot-status == 0 ? "Secure Boot: Deshabilitado" : root.secure-boot-status == -2 ? "Secure Boot: Comprobando…" : "Secure Boot: No se pudo comprobar";
+                        color: #d0d0d0; font-size: 13px; vertical-alignment: center; horizontal-stretch: 0;
+                    }
+                }
                 Rectangle {
                     height: 6px;
                     border-radius: 3px;
-                    background: #414141;
+                    background: #77777777;
                     Rectangle { x: 0px; width: parent.width * root.progress; height: parent.height; border-radius: 3px; background: #e3e6eb; }
                 }
             }
@@ -449,8 +901,8 @@ export component MainWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             border-radius: 14px;
-            background: #282828;
-            border-color: #656565;
+            background: #282828f2;
+            border-color: #aaaaaa77;
             border-width: 1px;
             VerticalLayout {
                 padding: 25px;
@@ -462,8 +914,8 @@ export component MainWindow inherits Window {
                 Rectangle { vertical-stretch: 1; background: transparent; }
                 HorizontalLayout {
                     spacing: 10px;
-                    ActionButton { label: "Cancelar"; width: 130px; clicked => { root.cancel-prepare(); } }
-                    ActionButton { label: root.reuse-ventoy && !root.confirm-reinstall ? "Copiar ISO" : "Borrar y preparar"; width: 175px; primary: true; clicked => { root.confirm-prepare(); } }
+                    ActionButton { label: "Cancelar"; help-text: "Cierra esta confirmación sin modificar la unidad USB."; help-above: true; width: 130px; clicked => { root.cancel-prepare(); } }
+                    ActionButton { label: root.reuse-ventoy && !root.confirm-reinstall ? "Copiar ISO" : "Borrar y preparar"; help-text: root.reuse-ventoy && !root.confirm-reinstall ? "Confirma la copia de la ISO sin formatear la unidad." : "Confirma el borrado y la preparación de la unidad seleccionada."; help-above: true; width: 175px; primary: true; clicked => { root.confirm-prepare(); } }
                 }
             }
         }
@@ -477,8 +929,8 @@ export component MainWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             border-radius: 12px;
-            background: #252525;
-            border-color: #666666;
+            background: #282828f2;
+            border-color: #aaaaaa77;
             border-width: 1px;
             VerticalLayout {
                 padding: 18px;
@@ -486,35 +938,35 @@ export component MainWindow inherits Window {
                 HorizontalLayout {
                     Text { text: "Registro y diagnóstico"; color: #ffffff; font-size: 20px; font-weight: 700; }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
-                    ActionButton { label: "Cerrar"; width: 82px; clicked => { root.close-logs(); } }
+                    ActionButton { label: "Cerrar"; help-text: "Cierra el registro y vuelve a la pantalla principal."; help-align-right: true; width: 82px; clicked => { root.close-logs(); } }
                 }
                 Text { text: "El registro se actualiza mientras la ventana está abierta. Puedes seleccionar y copiar líneas."; color: #bfc5cd; font-size: 12px; }
                 TextEdit { text: root.log-text; read-only: true; font-size: 12px; }
                 HorizontalLayout {
                     spacing: 8px;
-                    ActionButton { label: "Copiar todo"; width: 112px; clicked => { root.copy-logs(); } }
-                    ActionButton { label: "Abrir carpeta"; width: 118px; clicked => { root.open-log-folder(); } }
-                    ActionButton { label: "Exportar"; width: 94px; clicked => { root.export-logs(); } }
+                    ActionButton { label: "Copiar todo"; help-text: "Copia todas las líneas visibles del registro al portapapeles."; help-above: true; width: 112px; clicked => { root.copy-logs(); } }
+                    ActionButton { label: "Abrir carpeta"; help-text: "Abre la carpeta donde se guarda el archivo del registro."; help-above: true; width: 118px; clicked => { root.open-log-folder(); } }
+                    ActionButton { label: "Exportar"; help-text: "Guarda una copia del registro para revisarla o compartirla."; help-above: true; width: 94px; clicked => { root.export-logs(); } }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
-                    ActionButton { label: "Limpiar"; width: 88px; clicked => { root.clear-logs(); } }
+                    ActionButton { label: "Limpiar"; help-text: "Vacía el contenido del registro mostrado."; help-align-right: true; help-above: true; width: 88px; clicked => { root.clear-logs(); } }
                 }
             }
         }
     }
 
     if root.success-visible : Rectangle {
-        background: #101113;
+        background: #101010;
         Image { source: root.success-backdrop; width: parent.width; height: parent.height; image-fit: fill; }
-        Rectangle { background: #08090b70; }
+        Rectangle { background: #08080870; }
         TouchArea { }
         Rectangle {
             width: Math.min(parent.width - 40px, 620px);
-            height: 398px;
+            height: 458px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             border-radius: 16px;
-            background: #252628;
-            border-color: #65686c;
+            background: #252525ed;
+            border-color: #aaaaaa70;
             border-width: 1px;
             Rectangle {
                 x: (parent.width - self.width) / 2; y: 28px;
@@ -539,21 +991,44 @@ export component MainWindow inherits Window {
             }
             Rectangle {
                 x: 25px; y: 210px; width: parent.width - 50px; height: 48px;
-                border-radius: 8px; background: #303234; border-color: #484b4e; border-width: 1px;
+                border-radius: 8px; background: #303030dd; border-color: #aaaaaa55; border-width: 1px;
                 Text { text: root.success-detail; x: 12px; width: parent.width - 24px; color: #f1f2f3; font-size: 13px; font-weight: 600; overflow: elide; vertical-alignment: center; }
             }
+            Rectangle {
+                x: 25px; y: 268px; width: parent.width - 50px; height: 56px;
+                border-radius: 8px;
+                background: root.secure-boot-status == 1 ? #302528e8 : root.secure-boot-status == 0 ? #222c25e8 : #2b2b2be8;
+                border-color: root.secure-boot-status == 1 ? #a9707888 : root.secure-boot-status == 0 ? #6ea67977 : #aaaaaa66;
+                border-width: 1px;
+                Rectangle {
+                    x: 13px; y: 23px; width: 9px; height: 9px; border-radius: 5px;
+                    background: root.secure-boot-status == 1 ? #e56868 : root.secure-boot-status == 0 ? #51cc79 : #a0a0a0;
+                }
+                Text {
+                    x: 32px; y: 7px; width: parent.width - 44px; height: 42px;
+                    text: root.secure-boot-status == 1
+                        ? "Secure Boot habilitado. Desactívalo en UEFI antes de arrancar desde este USB para evitar «Security Violation [0x0]»."
+                        : root.secure-boot-status == 0
+                        ? "Secure Boot deshabilitado. Ya puedes arrancar desde el USB sin cambiar este ajuste."
+                        : root.secure-boot-status == -2
+                        ? "Comprobando el estado de Secure Boot antes de iniciar la instalación…"
+                        : "No se pudo comprobar Secure Boot. Verifica en UEFI que esté deshabilitado antes de arrancar desde el USB para evitar «Security Violation [0x0]».";
+                    color: root.secure-boot-status == 1 ? #f1c6cb : root.secure-boot-status == 0 ? #b9dfbf : #d6d6d6;
+                    font-size: 13px; font-weight: 600; wrap: word-wrap; vertical-alignment: center;
+                }
+            }
             Text {
-                text: root.restart-message == "" ? "Guarda tu trabajo. Windows abrirá Inicio avanzado; elige «Usar un dispositivo» y selecciona tu USB." : root.restart-message;
-                x: 30px; y: 270px; width: parent.width - 60px; height: 42px;
+                text: root.restart-message == "" ? root.restart-instructions : root.restart-message;
+                x: 30px; y: 337px; width: parent.width - 60px; height: 42px;
                 color: root.restart-message == "" ? #afb7c0 : #f2c3bb;
                 font-size: 13px; wrap: word-wrap; horizontal-alignment: center;
             }
             HorizontalLayout {
-                x: 24px; y: 333px; width: parent.width - 48px; height: 40px;
+                x: 24px; y: 396px; width: parent.width - 48px; height: 40px;
                 spacing: 10px;
-                ActionButton { label: "Cerrar"; horizontal-stretch: 1; clicked => { root.close-success(); } }
-                ActionButton { label: "Salir de la app"; horizontal-stretch: 1; clicked => { root.close-app(); } }
-                ActionButton { label: root.restart-pending ? "Reiniciando…" : "Reiniciar y elegir USB"; horizontal-stretch: 2; primary: true; enabled: !root.restart-pending; clicked => { root.restart-to-usb(); } }
+                ActionButton { label: "Cerrar"; help-text: "Cierra este resumen y vuelve a la aplicación."; help-above: true; horizontal-stretch: 1; clicked => { root.close-success(); } }
+                ActionButton { label: "Salir de la app"; help-text: "Cierra WinSlim USB Creator; el USB preparado permanecerá listo."; help-above: true; horizontal-stretch: 1; clicked => { root.close-app(); } }
+                ActionButton { label: root.restart-pending ? "Reiniciando…" : "Reiniciar y elegir USB"; help-text: "Reinicia el equipo y abre las opciones de arranque para elegir la unidad USB."; help-align-right: true; help-above: true; horizontal-stretch: 2; primary: true; enabled: !root.restart-pending; clicked => { root.restart-to-usb(); } }
             }
         }
     }

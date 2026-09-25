@@ -4,6 +4,7 @@ Add-Type -AssemblyName System.Drawing
 $assetDir = Join-Path $PSScriptRoot '..\assets'
 New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
 $pngPath = Join-Path $assetDir 'icon.png'
+$headerPngPath = Join-Path $assetDir 'icon-header-40.png'
 $icoPath = Join-Path $assetDir 'icon.ico'
 
 function RoundedPath([single]$x, [single]$y, [single]$w, [single]$h, [single]$r) {
@@ -87,6 +88,24 @@ $g.DrawPath((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(55,
 $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)), $w)
 $g.ResetTransform()
 $bitmap.Save($pngPath, [System.Drawing.Imaging.ImageFormat]::Png)
+
+# Render the header icon at its actual UI size with high-quality downsampling.
+# This avoids repeatedly reducing the 256px app icon in the software renderer.
+$headerBitmap = New-Object System.Drawing.Bitmap 40, 40, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+$headerGraphics = [System.Drawing.Graphics]::FromImage($headerBitmap)
+$headerGraphics.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+$headerGraphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+$headerGraphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+$headerGraphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+$headerGraphics.DrawImage(
+    $bitmap,
+    [System.Drawing.Rectangle]::new(0, 0, 40, 40),
+    [System.Drawing.Rectangle]::new(0, 0, 256, 256),
+    [System.Drawing.GraphicsUnit]::Pixel
+)
+$headerBitmap.Save($headerPngPath, [System.Drawing.Imaging.ImageFormat]::Png)
+$headerGraphics.Dispose()
+$headerBitmap.Dispose()
 $g.Dispose()
 $bitmap.Dispose()
 

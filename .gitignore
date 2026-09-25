@@ -5,6 +5,9 @@
 # WinSlimUsbCreator/vendor/ventoy-1.1.17-windows.zip.
 /Codigo fuente Ventoy/
 
+# Fuente de AB Download Manager usada solo como referencia para el descargador.
+/Codigo fuente AB-Download Manager/
+
 # Salidas de compilacion, paquetes publicables y descargas temporales.
 /WinSlimUsbCreator/target/
 /WinSlimUsbCreator/cache/

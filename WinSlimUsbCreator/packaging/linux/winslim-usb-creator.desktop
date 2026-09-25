@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=WinSlim USB Creator
+Comment=Prepara un USB de instalación de WinSlim
+Exec=winslim-usb-creator
+Icon=winslim-usb-creator
+Terminal=false
+Categories=Utility;System;
