@@ -91,6 +91,8 @@ const RSS: &str = "https://sourceforge.net/projects/winslim11-isos/rss?path=/";
 const ALTERNATIVE_RELEASE_API: &str =
     "https://api.github.com/repos/Christianlg97/WinSlim_Mirroring/releases/tags/Latest_Mirror_URL";
 const ALTERNATIVE_RELEASE_TAG: &str = "Latest_Mirror_URL";
+const MAIN_SERVER_UNAVAILABLE_MESSAGE: &str =
+    "La ISO no está disponible en el servidor principal. Prueba con la descarga alternativa.";
 #[derive(Clone)]
 struct Iso {
     name: String,
@@ -391,6 +393,62 @@ fn fetch_alternative_link() -> Result<url::Url, String> {
         return Err("GitHub devolvió una release distinta de la esperada".into());
     }
     alternative_link_from_notes(release.body.as_deref().unwrap_or(""))
+}
+
+fn fetch_available_alternative_link() -> Result<url::Url, String> {
+    let link = fetch_alternative_link()?;
+    // Solo leemos las cabeceras: un enlace borrado o privado no cuenta como alternativa.
+    let response = ureq::builder()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(10))
+        .build()
+        .get(link.as_str())
+        .set("User-Agent", "WinSlimUsbCreator/0.1")
+        .call()
+        .map_err(|error| match error {
+            ureq::Error::Status(code, _) => {
+                format!("La descarga alternativa respondió HTTP {code}")
+            }
+            ureq::Error::Transport(transport) => {
+                format!("No se pudo acceder a la descarga alternativa: {transport}")
+            }
+        })?;
+    let final_host = url::Url::parse(response.get_url())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    if final_host.as_deref() == Some("accounts.google.com") {
+        return Err("La descarga alternativa requiere iniciar sesión en Google".into());
+    }
+    Ok(link)
+}
+
+fn alternative_availability() -> i32 {
+    match fetch_available_alternative_link() {
+        Ok(link) => {
+            log_event(format!(
+                "INFO etapa=comprobar_alternativa disponible=true dominio={}",
+                link.host_str().unwrap_or("")
+            ));
+            1
+        }
+        Err(error) => {
+            log_event(format!(
+                "WARNING etapa=comprobar_alternativa disponible=false detalle={error}"
+            ));
+            -1
+        }
+    }
+}
+
+/// Marca el servidor principal como no disponible y comprueba si queda la alternativa.
+fn report_main_server_failure(weak: slint::Weak<MainWindow>) -> bool {
+    status(weak.clone(), "Comprobando la descarga alternativa…");
+    let alternative = alternative_availability();
+    ui(weak, move |window| {
+        window.set_server_availability(-1);
+        window.set_alternative_availability(alternative);
+    });
+    alternative == 1
 }
 
 fn parse_latest(xml: &str) -> Result<Iso, String> {
@@ -1510,8 +1568,16 @@ fn start_server_check(weak: slint::Weak<MainWindow>, running: Arc<AtomicBool>) {
                 "WARNING etapa=comprobar_servidor iso_disponible=false detalle={error}"
             )),
         }
+        // Ambos estados se publican juntos para no mostrar «Descarga no disponible»
+        // mientras todavía se comprueba la alternativa.
+        let alternative = if available {
+            0
+        } else {
+            alternative_availability()
+        };
         ui(weak, move |window| {
             window.set_server_availability(if available { 1 } else { -1 });
+            window.set_alternative_availability(alternative);
         });
         running.store(false, Ordering::Release);
     });
@@ -2134,11 +2200,15 @@ fn main() -> Result<(), slint::PlatformError> {
                         }
                     });
                 }
-                finish(
-                    weak,
-                    result.map(|_| "ISO más reciente encontrada".into()),
-                    state,
-                );
+                let result = match result {
+                    Ok(_) => Ok("ISO más reciente encontrada".into()),
+                    Err(error) if report_main_server_failure(weak.clone()) => {
+                        log_event(format!("WARNING etapa=consultar_iso detalle={error}"));
+                        Ok(MAIN_SERVER_UNAVAILABLE_MESSAGE.into())
+                    }
+                    Err(error) => Err(error),
+                };
+                finish(weak, result, state);
             });
         });
     }
@@ -2169,6 +2239,10 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                     Err(_) if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED => {
                         Err(DOWNLOAD_CANCELLED_MESSAGE.into())
+                    }
+                    Err(error) if report_main_server_failure(weak.clone()) => {
+                        log_event(format!("WARNING etapa=consultar_iso detalle={error}"));
+                        Err(MAIN_SERVER_UNAVAILABLE_MESSAGE.into())
                     }
                     Err(error) => Err(error),
                 };
@@ -2260,15 +2334,19 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state.clone();
         window.on_download_alternative_iso(move || {
             let Some(window) = weak.upgrade() else { return };
-            let has_iso = state.lock().unwrap().iso.is_some();
-            if !has_iso || !begin(&state, &window) {
+            if !begin(&state, &window) {
                 return;
             }
             window.set_status_text("Consultando el enlace alternativo en GitHub…".into());
             let weak = weak.clone();
             let state = state.clone();
             thread::spawn(move || {
-                let result = fetch_alternative_link().and_then(|link| {
+                let result = fetch_available_alternative_link();
+                let alternative = if result.is_ok() { 1 } else { -1 };
+                ui(weak.clone(), move |window| {
+                    window.set_alternative_availability(alternative)
+                });
+                let result = result.and_then(|link| {
                     open_url(link.as_str())
                         .map_err(|error| format!("No se pudo abrir el navegador: {error}"))?;
                     log_event(format!(

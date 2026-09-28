@@ -282,6 +282,12 @@ export component MainWindow inherits Window {
     in-out property <string> iso-size: "";
     // -1: descarga no disponible; 0: comprobando; 1: ISO accesible.
     in-out property <int> server-availability: 0;
+    // -1: sin descarga alternativa; 0: sin comprobar; 1: enlace alternativo accesible.
+    in-out property <int> alternative-availability: 0;
+    // El servidor principal no ofrece la ISO, pero la descarga alternativa sí.
+    private property <bool> alternative-only: root.server-availability == -1 && root.alternative-availability == 1;
+    // Pasos sin ISO que descargar del servidor principal: se ofrece la alternativa junto a la búsqueda.
+    private property <bool> alternative-mode: root.alternative-only && !root.download-active && (root.iso-stage == 0 || root.iso-stage == 3);
     in-out property <string> local-file: "Sin descargar";
     in-out property <string> status-text: "Listo";
     // -2: comprobando; -1: no se pudo comprobar; 0: deshabilitado; 1: habilitado.
@@ -461,7 +467,7 @@ export component MainWindow inherits Window {
                 }
 
                 Rectangle {
-                    height: root.download-active ? 220px : root.iso-stage == 2 ? (root.width < 900px ? 270px : 260px) : root.iso-stage == 1 ? (root.width >= 1020px ? 235px : 278px) : root.iso-stage == 3 ? 235px : 220px;
+                    height: root.download-active ? 220px : root.alternative-mode ? (root.width >= 900px ? 235px : 295px) : root.iso-stage == 2 ? (root.width < 900px ? 270px : 260px) : root.iso-stage == 1 ? (root.width >= 1020px ? 235px : 278px) : root.iso-stage == 3 ? 235px : 220px;
                     border-radius: 14px;
                     background: root.active-step == 1 ? #202020ee : root.active-step > 1 ? #191919e8 : #161616e6;
                     border-color: root.active-step == 1 ? #d8d8d8ae : root.active-step > 1 ? #99999970 : #77777755;
@@ -490,6 +496,8 @@ export component MainWindow inherits Window {
                                 ? "La ISO local está lista para el paso 02. Puedes cambiarla o descargar la última versión."
                                 : root.iso-stage == 3
                                 ? "La ISO descargada está lista para el paso 02. Puedes buscar otra versión o cargar una imagen local."
+                                : root.alternative-mode
+                                ? "La ISO no está disponible en el servidor principal. Prueba con «Descarga alternativa de la ISO» o elige una imagen de tu equipo con «Cargar ISO local»."
                                 : "Selecciona «Buscar última ISO de WinSlim en línea» para consultar la versión más reciente, o «Cargar ISO local» para elegir una imagen de tu equipo.";
                             color: #b9c0cc;
                             font-size: 14px;
@@ -533,12 +541,12 @@ export component MainWindow inherits Window {
                                 width: 10px; height: 20px; background: transparent;
                                 Rectangle {
                                     y: 5px; width: 10px; height: 10px; border-radius: 5px;
-                                    background: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #51cc79 : root.server-availability == -1 ? #e56868 : #aab3be;
+                                    background: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #51cc79 : root.alternative-only ? #e0b24f : root.server-availability == -1 ? #e56868 : #aab3be;
                                 }
                             }
                             Text {
-                                text: root.iso-stage == 2 && !root.download-active ? "ISO local cargada" : root.server-availability == 1 ? "Servidor en línea · Última ISO de WinSlim disponible para descargar" : root.server-availability == -1 ? "Descarga no disponible" : "Comprobando disponibilidad de la ISO…";
-                                color: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #9be4ae : root.server-availability == -1 ? #f0a4a4 : #afb4bd;
+                                text: root.iso-stage == 2 && !root.download-active ? "ISO local cargada" : root.server-availability == 1 ? "Servidor en línea · Última ISO de WinSlim disponible para descargar" : root.alternative-only ? "ISO no disponible en el servidor principal · Prueba la descarga alternativa" : root.server-availability == -1 ? "Descarga no disponible" : "Comprobando disponibilidad de la ISO…";
+                                color: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #9be4ae : root.alternative-only ? #f0d08c : root.server-availability == -1 ? #f0a4a4 : #afb4bd;
                                 font-size: 14px;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
@@ -552,7 +560,7 @@ export component MainWindow inherits Window {
                             wrap: word-wrap;
                             vertical-stretch: 0;
                         }
-                        if root.download-active || root.iso-stage != 1 : HorizontalLayout {
+                        if root.download-active || (root.iso-stage != 1 && !root.alternative-mode) : HorizontalLayout {
                             spacing: 10px;
                             if root.download-active : ActionButton {
                                 label: root.download-cancelling ? "Cancelando…" : "Cancelar descarga";
@@ -571,7 +579,7 @@ export component MainWindow inherits Window {
                                 enabled: !root.busy;
                                 clicked => { root.lookup-iso(); }
                             }
-                            if !root.download-active && root.iso-stage == 2 : ActionButton {
+                            if !root.download-active && root.iso-stage == 2 && !root.alternative-only : ActionButton {
                                 label: "Descargar última ISO";
                                 help-text: "Busca y descarga la última ISO. La imagen local seguirá disponible durante la descarga.";
                                 width: 185px;
@@ -579,11 +587,79 @@ export component MainWindow inherits Window {
                                 enabled: !root.busy;
                                 clicked => { root.download-latest-iso(); }
                             }
+                            if !root.download-active && root.iso-stage == 2 && root.alternative-only : ActionButton {
+                                label: "Descarga alternativa de la ISO";
+                                help-text: "La ISO no está disponible en el servidor principal. Abre en el navegador una opción alternativa para descargarla.";
+                                width: 240px;
+                                primary: true;
+                                enabled: !root.busy;
+                                clicked => { root.download-alternative-iso(); }
+                            }
                             if !root.download-active : ActionButton {
                                 label: root.iso-stage == 2 || root.iso-stage == 3 ? "Cambiar ISO local" : "Cargar ISO local";
                                 help-text: "Abre el explorador para elegir una ISO guardada en el equipo.";
                                 width: 150px;
                                 quiet: root.iso-stage >= 2;
+                                enabled: !root.busy;
+                                clicked => { root.load-local-iso(); }
+                            }
+                        }
+                        if root.alternative-mode && root.width >= 900px : HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton {
+                                label: "Descarga alternativa de la ISO";
+                                help-text: "La ISO no está disponible en el servidor principal. Abre en el navegador una opción alternativa para descargarla.";
+                                min-width: 240px;
+                                horizontal-stretch: 1;
+                                primary: root.iso-stage == 0;
+                                enabled: !root.busy;
+                                clicked => { root.download-alternative-iso(); }
+                            }
+                            ActionButton {
+                                label: "Volver a buscar la última ISO";
+                                help-text: "Comprueba de nuevo si la ISO está disponible en el servidor principal.";
+                                min-width: 255px;
+                                horizontal-stretch: 1;
+                                quiet: true;
+                                enabled: !root.busy;
+                                clicked => { root.lookup-iso(); }
+                            }
+                            ActionButton {
+                                label: root.iso-stage == 3 ? "Cambiar ISO local" : "Cargar ISO local";
+                                help-text: "Elige una ISO que ya esté guardada en el equipo.";
+                                help-align-right: true;
+                                min-width: 175px;
+                                horizontal-stretch: 1;
+                                quiet: true;
+                                enabled: !root.busy;
+                                clicked => { root.load-local-iso(); }
+                            }
+                        }
+                        if root.alternative-mode && root.width < 900px : ActionButton {
+                            label: "Descarga alternativa de la ISO";
+                            help-text: "La ISO no está disponible en el servidor principal. Abre en el navegador una opción alternativa para descargarla.";
+                            primary: root.iso-stage == 0;
+                            enabled: !root.busy;
+                            clicked => { root.download-alternative-iso(); }
+                        }
+                        if root.alternative-mode && root.width < 900px : HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton {
+                                label: "Volver a buscar la última ISO";
+                                help-text: "Comprueba de nuevo si la ISO está disponible en el servidor principal.";
+                                min-width: 255px;
+                                horizontal-stretch: 1;
+                                quiet: true;
+                                enabled: !root.busy;
+                                clicked => { root.lookup-iso(); }
+                            }
+                            ActionButton {
+                                label: root.iso-stage == 3 ? "Cambiar ISO local" : "Cargar ISO local";
+                                help-text: "Elige una ISO que ya esté guardada en el equipo.";
+                                help-align-right: true;
+                                min-width: 175px;
+                                horizontal-stretch: 1;
+                                quiet: true;
                                 enabled: !root.busy;
                                 clicked => { root.load-local-iso(); }
                             }
