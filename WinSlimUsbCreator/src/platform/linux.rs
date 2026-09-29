@@ -453,9 +453,16 @@ pub(super) fn prepare(
     force_reinstall: bool,
     weak: slint::Weak<MainWindow>,
 ) -> Result<String, String> {
-    if !verify_file(&local_iso, &iso)? {
+    if !verify_file(
+        &local_iso,
+        &iso,
+        &weak,
+        "Comprobando la integridad de la ISO",
+        None,
+    )? {
         return Err("La ISO local no coincide con SourceForge. Descárgala de nuevo.".into());
     }
+    status(weak.clone(), "Comprobando la unidad USB…");
     let current = disks()?
         .into_iter()
         .find(|item| item.device_path == disk.device_path)
@@ -601,17 +608,11 @@ pub(super) fn prepare(
     } else {
         root.join(&iso.name)
     };
+    remove_stale_usb_copies(&root);
     if fs_free_bytes(&root)? < iso.size {
         return Err("La partición no tiene espacio suficiente para la ISO".into());
     }
-    let temporary = root.join(format!(
-        ".winslim-copy-{}-{}.part",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos()
-    ));
+    let temporary = usb_copy_temp_path(&root)?;
     status(weak.clone(), "Copiando la ISO al USB…");
     if let Err(error) = copy_with_progress(&local_iso, &temporary, iso.size, weak.clone()) {
         let _ = fs::remove_file(&temporary);
@@ -662,6 +663,16 @@ pub(super) fn publish_iso(from: &Path, to: &Path) -> Result<(), String> {
 
 pub(super) fn publish_config(from: &Path, to: &Path) -> Result<(), String> {
     fs::rename(from, to).map_err(|error| file_error("publicar configuración de Ventoy", to, error))
+}
+
+/// Abre un archivo recién sincronizado y descarta sus páginas de la caché para
+/// que la lectura de verificación llegue al USB en lugar de salir de la RAM.
+pub(super) fn open_uncached(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::io::AsRawFd;
+    let file = File::open(path)?;
+    // Es una sugerencia al núcleo: si no se aplica, la verificación sigue siendo válida.
+    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    Ok(file)
 }
 
 pub(super) fn fs_free_bytes(root: &Path) -> Result<u64, String> {

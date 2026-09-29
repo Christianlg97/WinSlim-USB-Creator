@@ -1,9 +1,9 @@
 use super::*;
 use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::os::windows::{ffi::OsStrExt, process::CommandExt};
+use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, process::CommandExt};
 use windows_sys::Win32::Storage::FileSystem::{
-    GetDiskFreeSpaceExW, MoveFileExW, MoveFileW, SetVolumeLabelW, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH,
+    GetDiskFreeSpaceExW, MoveFileExW, MoveFileW, SetVolumeLabelW, FILE_FLAG_NO_BUFFERING,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 use windows_sys::Win32::{
     Foundation::RECT,
@@ -12,6 +12,7 @@ use windows_sys::Win32::{
         GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
     },
     UI::{
+        HiDpi::GetDpiForSystem,
         Shell::ShellExecuteW,
         WindowsAndMessaging::{
             GetClientRect, SystemParametersInfoW, SPI_GETWORKAREA, SW_SHOWNORMAL,
@@ -155,16 +156,27 @@ pub(super) fn ventoy_exe() -> Result<PathBuf, String> {
         .join("ventoy-1.1.17");
     let package = dir.join("ventoy-1.1.17");
     let exe = package.join("Ventoy2Disk_X64.exe");
-    if exe.exists() && package.join("ventoy").join("ventoy.disk.img.xz").exists() {
-        log_event(format!(
-            "INFO etapa=ventoy paquete_extraido ruta={}",
-            package.display()
-        ));
-        return Ok(exe);
-    }
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(VENTOY_ARCHIVE)).map_err(|e| e.to_string())?;
+    // Ventoy se ejecuta con elevación desde una carpeta del usuario: la copia
+    // extraída solo se reutiliza si coincide byte a byte con el paquete verificado.
+    if exe.exists() {
+        match extracted_ventoy_matches(&mut archive, &dir, &exe) {
+            Ok(true) => {
+                log_event(format!(
+                    "INFO etapa=ventoy paquete_extraido verificado=true ruta={}",
+                    package.display()
+                ));
+                return Ok(exe);
+            }
+            Ok(false) => log_event(format!(
+                "WARNING etapa=ventoy paquete_extraido_distinto reextraer ruta={}",
+                package.display()
+            )),
+            Err(error) => return Err(error),
+        }
+    }
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
         let Some(name) = entry.enclosed_name() else {
@@ -188,6 +200,56 @@ pub(super) fn ventoy_exe() -> Result<PathBuf, String> {
         package.display()
     ));
     Ok(exe)
+}
+
+const VENTOY_X64_ENTRY: &str = "ventoy-1.1.17/altexe/Ventoy2Disk_X64.exe";
+
+fn sha256_of(reader: &mut impl Read) -> std::io::Result<Vec<u8>> {
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        let len = reader.read(&mut buffer)?;
+        if len == 0 {
+            break;
+        }
+        hash.update(&buffer[..len]);
+    }
+    Ok(hash.finalize().to_vec())
+}
+
+/// Un archivo ausente, ilegible o distinto cuenta como no coincidente.
+fn file_matches_sha256(path: &Path, expected: &[u8]) -> bool {
+    File::open(path)
+        .and_then(|mut file| sha256_of(&mut file))
+        .is_ok_and(|actual| actual == expected)
+}
+
+/// Compara cada archivo del ZIP con su copia extraída y el ejecutable x64 con
+/// su original en `altexe`. Los archivos que genera Ventoy (cli_log.txt, etc.)
+/// no forman parte del paquete y no se comprueban.
+fn extracted_ventoy_matches(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    dir: &Path,
+    exe: &Path,
+) -> Result<bool, String> {
+    let mut x64_hash = None;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.enclosed_name() else {
+            return Err("Ruta no segura en el paquete de Ventoy".into());
+        };
+        let expected = sha256_of(&mut entry).map_err(|e| e.to_string())?;
+        if !file_matches_sha256(&dir.join(&name), &expected) {
+            return Ok(false);
+        }
+        if name == Path::new(VENTOY_X64_ENTRY) {
+            x64_hash = Some(expected);
+        }
+    }
+    Ok(x64_hash.is_some_and(|expected| file_matches_sha256(exe, &expected)))
 }
 
 pub(super) fn ps_quote(s: &str) -> String {
@@ -371,9 +433,16 @@ pub(super) fn prepare(
     force_reinstall: bool,
     weak: slint::Weak<MainWindow>,
 ) -> Result<String, String> {
-    if !verify_file(&local_iso, &iso)? {
+    if !verify_file(
+        &local_iso,
+        &iso,
+        &weak,
+        "Comprobando la integridad de la ISO",
+        None,
+    )? {
         return Err("La ISO local no coincide con SourceForge. Descárgala de nuevo.".into());
     }
+    status(weak.clone(), "Comprobando la unidad USB…");
     let current = disks()?
         .into_iter()
         .find(|d| d.number == disk.number)
@@ -464,18 +533,12 @@ pub(super) fn prepare(
         destination.display(),
         iso.size
     ));
+    remove_stale_usb_copies(&root);
     let free = fs_free_bytes(&root)?;
     if free < iso.size {
         return Err("La nueva partición no tiene espacio suficiente para la ISO".into());
     }
-    let temporary = root.join(format!(
-        ".winslim-copy-{}-{}.part",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos()
-    ));
+    let temporary = usb_copy_temp_path(&root)?;
     status(weak.clone(), "Copiando la ISO al USB…");
     if let Err(error) = copy_with_progress(&local_iso, &temporary, iso.size, weak.clone()) {
         let _ = fs::remove_file(&temporary);
@@ -511,6 +574,15 @@ pub(super) fn prepare(
         destination.file_name().unwrap().to_string_lossy(),
         theme_warning
     ))
+}
+
+/// Abre un archivo para leerlo directamente del dispositivo, sin la caché de
+/// Windows. Exige búferes y tamaños de lectura alineados con el sector.
+pub(super) fn open_uncached(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_NO_BUFFERING)
+        .open(path)
 }
 
 pub(super) fn fs_free_bytes(root: &Path) -> Result<u64, String> {
@@ -632,7 +704,10 @@ pub(super) fn size_initial_window(window: &MainWindow) {
     if found == 0 {
         return;
     }
-    let scale = window.window().scale_factor().max(1.0);
+    // La ventana nativa aún no existe y `scale_factor()` devolvería 1.0: con la
+    // escala de Windows al 125-150 % la ventana saldría más alta que la pantalla.
+    // El área de trabajo está en píxeles físicos, así que se usa el DPI del sistema.
+    let scale = (unsafe { GetDpiForSystem() } as f32 / 96.0).max(1.0);
     let available_width = (work_area.right - work_area.left) as f32 / scale - 24.0;
     let available_height = (work_area.bottom - work_area.top) as f32 / scale - 32.0;
     let width = 1200.0_f32.min(available_width).max(680.0);
@@ -745,5 +820,37 @@ pub(super) fn open_url(url: &str) -> Result<(), String> {
             "Windows no pudo abrir el enlace (código {})",
             result as isize
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modified_ventoy_extraction_is_detected() {
+        let dir = std::env::temp_dir().join(format!(
+            "winslim-ventoy-verify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(VENTOY_ARCHIVE)).unwrap();
+        archive.extract(&dir).unwrap();
+        let exe = dir.join("ventoy-1.1.17").join("Ventoy2Disk_X64.exe");
+        fs::copy(dir.join(VENTOY_X64_ENTRY), &exe).unwrap();
+        assert!(extracted_ventoy_matches(&mut archive, &dir, &exe).unwrap());
+
+        fs::write(&exe, b"otro programa").unwrap();
+        assert!(!extracted_ventoy_matches(&mut archive, &dir, &exe).unwrap());
+
+        fs::copy(dir.join(VENTOY_X64_ENTRY), &exe).unwrap();
+        let image = dir.join("ventoy-1.1.17").join("ventoy").join("ventoy.disk.img.xz");
+        fs::write(&image, b"").unwrap();
+        assert!(!extracted_ventoy_matches(&mut archive, &dir, &exe).unwrap());
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }

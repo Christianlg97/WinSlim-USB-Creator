@@ -27,10 +27,10 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, MutexGuard, PoisonError,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -144,7 +144,59 @@ struct State {
     local_iso: Option<PathBuf>,
     disks: Vec<Disk>,
     selected: Option<u32>,
+    // Disco mostrado en el diálogo de confirmación: se prepara ese y no otro.
+    confirming: Option<u32>,
     busy: bool,
+}
+
+/// Un pánico en un hilo envenena el Mutex; el estado sigue siendo coherente
+/// porque cada sección solo asigna campos, así que se recupera en vez de abortar.
+fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Si un hilo de trabajo entra en pánico, `finish` no llega a ejecutarse.
+/// Este guardián libera la interfaz para que no quede bloqueada como ocupada.
+struct PanicGuard {
+    weak: slint::Weak<MainWindow>,
+    state: Arc<Mutex<State>>,
+    download_state: Option<Arc<AtomicU8>>,
+}
+
+impl PanicGuard {
+    fn new(
+        weak: &slint::Weak<MainWindow>,
+        state: &Arc<Mutex<State>>,
+        download_state: Option<&Arc<AtomicU8>>,
+    ) -> Self {
+        Self {
+            weak: weak.clone(),
+            state: state.clone(),
+            download_state: download_state.cloned(),
+        }
+    }
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            return;
+        }
+        lock_state(&self.state).busy = false;
+        if let Some(download_state) = &self.download_state {
+            download_state.store(DOWNLOAD_IDLE, Ordering::Release);
+        }
+        log_event("ERROR etapa=hilo_trabajo panico=true interfaz_liberada".into());
+        ui(self.weak.clone(), |window| {
+            window.set_busy(false);
+            window.set_usb_detecting(false);
+            window.set_download_active(false);
+            window.set_download_cancelling(false);
+            window.set_preparing(false);
+            window.set_progress(0.0);
+            window.set_status_text("Error interno inesperado. Consulta el Registro.".into());
+        });
+    }
 }
 
 fn ui<F: FnOnce(MainWindow) + Send + 'static>(weak: slint::Weak<MainWindow>, f: F) {
@@ -161,13 +213,14 @@ fn status(weak: slint::Weak<MainWindow>, message: impl Into<String>) {
 }
 
 fn finish(weak: slint::Weak<MainWindow>, result: Result<String, String>, state: Arc<Mutex<State>>) {
-    state.lock().unwrap().busy = false;
+    lock_state(&state).busy = false;
     log_event(match &result {
         Ok(message) => format!("INFO resultado=OK detalle={message}"),
         Err(message) => format!("ERROR resultado=FALLO detalle={message}"),
     });
     ui(weak, move |window| {
         window.set_busy(false);
+        window.set_preparing(false);
         window.set_status_text(match result {
             Ok(message) => message.into(),
             Err(message) => format!("Error: {message}").into(),
@@ -204,45 +257,96 @@ fn finish_download(
     );
 }
 
+// Al superar este tamaño, el registro pasa a operations.log.1 y se empieza otro.
+const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const LOG_VIEW_BYTES: u64 = 500_000;
+// Varios hilos registran a la vez (p. ej. las conexiones paralelas); el cerrojo
+// evita líneas mezcladas y que dos hilos roten el archivo al mismo tiempo.
+static LOG_LOCK: Mutex<()> = Mutex::new(());
+
+fn rotated_log_path(path: &Path) -> PathBuf {
+    path.with_extension("log.1")
+}
+
 fn log_event(message: String) {
     let Some(path) = log_path() else {
         return;
     };
-    if fs::create_dir_all(path.parent().unwrap()).is_err() {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    // La línea completa se forma antes de escribir para enviarla en una sola escritura.
+    let line = format!("{} {message}\n", httpdate::fmt_http_date(SystemTime::now()));
+    let _lock = LOG_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    if fs::create_dir_all(dir).is_err() {
         return;
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(
-            file,
-            "{} {message}",
-            httpdate::fmt_http_date(std::time::SystemTime::now())
-        );
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= LOG_MAX_BYTES) {
+        let _ = fs::rename(&path, rotated_log_path(&path));
     }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn clear_log() -> Result<(), String> {
+    let path = log_path().ok_or("No se encontró el directorio del registro")?;
+    let _lock = LOG_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    match fs::remove_file(rotated_log_path(&path)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    fs::write(&path, "").map_err(|error| error.to_string())
+}
+
+/// Guarda el registro completo: la parte rotada (más antigua) seguida de la actual.
+fn export_log(source: &Path, target: &Path) -> Result<(), String> {
+    let _lock = LOG_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut output = File::create(target).map_err(|error| error.to_string())?;
+    for path in [rotated_log_path(source), source.to_path_buf()] {
+        match File::open(&path) {
+            Ok(mut input) => {
+                std::io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    output.sync_all().map_err(|error| error.to_string())
 }
 
 fn read_log() -> String {
     let Some(path) = log_path() else {
         return "No se encontró el directorio del registro".into();
     };
-    match fs::read_to_string(path) {
-        Ok(contents) => {
-            let max = 500_000;
-            if contents.len() <= max {
-                contents
-            } else {
-                let mut start = contents.len() - max;
-                while !contents.is_char_boundary(start) {
-                    start += 1;
-                }
-                format!(
-                    "[Se muestran los últimos 500 KB del registro]\n{}",
-                    &contents[start..]
-                )
-            }
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return "El registro está vacío".into()
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "El registro está vacío".into(),
-        Err(e) => format!("No se pudo leer el registro: {e}"),
+        Err(e) => return format!("No se pudo leer el registro: {e}"),
+    };
+    // Solo se lee el final: el registro puede ocupar varios MB y esta función
+    // se ejecuta en el hilo de la interfaz mientras el panel está abierto.
+    let length = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let start = length.saturating_sub(LOG_VIEW_BYTES);
+    let mut bytes = Vec::new();
+    if let Err(e) = file
+        .seek(SeekFrom::Start(start))
+        .and_then(|_| file.read_to_end(&mut bytes))
+    {
+        return format!("No se pudo leer el registro: {e}");
     }
+    let mut contents = String::from_utf8_lossy(&bytes).into_owned();
+    if start > 0 {
+        // El corte puede caer a mitad de línea o de carácter: se empieza en la siguiente línea.
+        if let Some(newline) = contents.find('\n') {
+            contents.drain(..=newline);
+        }
+        contents.insert_str(0, "[Se muestran los últimos 500 KB del registro]\n");
+    }
+    contents
 }
 
 fn http_error(stage: &str, error: ureq::Error) -> String {
@@ -307,7 +411,7 @@ fn file_error(stage: &str, path: &Path, error: std::io::Error) -> String {
 }
 
 fn begin(state: &Arc<Mutex<State>>, window: &MainWindow) -> bool {
-    let mut state = state.lock().unwrap();
+    let mut state = lock_state(state);
     if state.busy {
         return false;
     }
@@ -461,8 +565,10 @@ fn parse_latest(xml: &str) -> Result<Iso, String> {
                 .and_then(|n| n.text())
                 .map(str::trim)
         };
-        let raw_name = get("title").unwrap_or("");
-        let name = raw_name.rsplit('/').next().unwrap_or("");
+        // Solo se aceptan ISOs de la raíz del proyecto: la descarga y la
+        // comprobación de espejos esperan /project/winslim11-isos/<nombre>, y
+        // así se ignoran subcarpetas como la .rsync-partial de una subida a medias.
+        let name = get("title").unwrap_or("").trim_start_matches('/');
         if !name.to_ascii_lowercase().starts_with("winslim")
             || !name.to_ascii_lowercase().ends_with(".iso")
             || name.contains(['/', '\\'])
@@ -470,9 +576,13 @@ fn parse_latest(xml: &str) -> Result<Iso, String> {
             continue;
         }
         let Some(url) = get("link") else { continue };
-        if !url.starts_with("https://sourceforge.net/projects/winslim11-isos/files/")
-            || !url.ends_with("/download")
-        {
+        let Some(file_part) = url
+            .strip_prefix("https://sourceforge.net/projects/winslim11-isos/files/")
+            .and_then(|rest| rest.strip_suffix("/download"))
+        else {
+            continue;
+        };
+        if file_part.contains('/') {
             continue;
         }
         let media = item
@@ -485,12 +595,20 @@ fn parse_latest(xml: &str) -> Result<Iso, String> {
         if size < 100_000_000 {
             continue;
         }
+        // SourceForge publica <media:hash algo="md5">; se exige el algoritmo y el
+        // formato para no comparar nunca el MD5 con otro tipo de suma.
         let md5 = media
             .and_then(|n| {
-                n.descendants()
-                    .find(|n| n.is_element() && n.tag_name().name() == "hash")
+                n.descendants().find(|n| {
+                    n.is_element()
+                        && n.tag_name().name() == "hash"
+                        && n.attribute("algo")
+                            .is_some_and(|algo| algo.eq_ignore_ascii_case("md5"))
+                })
             })
             .and_then(|n| n.text())
+            .map(str::trim)
+            .filter(|hash| hash.len() == 32 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .map(str::to_owned);
         let published = get("pubDate")
             .and_then(|s| httpdate::parse_http_date(&s.replace(" UT", " GMT")).ok())
@@ -999,7 +1117,15 @@ fn download_iso_to_inner(
         iso.size,
         final_path.display()
     ));
-    if final_path.exists() && verify_file(&final_path, iso)? {
+    if final_path.exists()
+        && verify_file(
+            &final_path,
+            iso,
+            &weak,
+            "Comprobando la ISO ya descargada",
+            Some(download_state),
+        )?
+    {
         commit_download(download_state)?;
         log_event(format!(
             "INFO etapa=descargar_iso archivo_existente_verificado ruta={}",
@@ -1043,7 +1169,12 @@ fn download_iso_to_inner(
         ));
     }
     if downloaded == iso.size {
-        if verify_file(&part, iso)? {
+        // El bucle anterior ya calculó el MD5 del archivo completo; no se vuelve a leer.
+        let complete = std::mem::replace(&mut hash, md5::Context::new());
+        let valid = iso.md5.as_ref().is_none_or(|expected| {
+            format!("{:x}", complete.compute()).eq_ignore_ascii_case(expected)
+        });
+        if valid {
             commit_download(download_state)?;
             if final_path.exists() {
                 fs::remove_file(&final_path)
@@ -1056,7 +1187,6 @@ fn download_iso_to_inner(
         fs::remove_file(&part)
             .map_err(|e| file_error("descartar descarga incorrecta", &part, e))?;
         downloaded = 0;
-        hash = md5::Context::new();
     }
     let mut initial_bytes = downloaded;
     let mut start = Instant::now();
@@ -1201,6 +1331,7 @@ fn download_iso_to_inner(
         } else {
             File::create(&part).map_err(|e| file_error("crear descarga temporal", &part, e))?
         };
+        let connection_start = downloaded;
         let mut interrupted = None;
         while downloaded < iso.size {
             if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED {
@@ -1259,6 +1390,11 @@ fn download_iso_to_inner(
             .map_err(|e| file_error("guardar descarga", &part, e))?;
         drop(file);
         check_download_cancellation(download_state)?;
+        // El límite de reintentos cuenta cortes seguidos sin avance, no todos los
+        // cortes de una ISO de varios GB: si esta conexión recibió datos, se reinicia.
+        if downloaded > connection_start {
+            attempts = 0;
+        }
         if let Some(reason) = interrupted {
             retry_iso_download(
                 weak.clone(),
@@ -1283,7 +1419,15 @@ fn download_iso_to_inner(
             log_event(format!(
                 "ERROR etapa=verificar_iso md5_esperado={expected} md5_obtenido={actual}"
             ));
-            return Err("La suma MD5 no coincide con la publicada por SourceForge".into());
+            // Un archivo completo con otro MD5 no se puede reanudar: conservarlo solo
+            // obligaría al siguiente intento a leerlo entero antes de descartarlo.
+            if let Err(error) = fs::remove_file(&part) {
+                file_error("descartar descarga con MD5 incorrecto", &part, error);
+            }
+            return Err(
+                "La suma MD5 no coincide con la publicada por SourceForge. Se descartó la descarga; pulsa Descargar para repetirla."
+                    .into(),
+            );
         }
     }
     commit_download(download_state)?;
@@ -1560,6 +1704,14 @@ fn start_server_check(weak: slint::Weak<MainWindow>, running: Arc<AtomicBool>) {
         return;
     }
     thread::spawn(move || {
+        // Se libera aunque el hilo falle; si no, no habría más comprobaciones.
+        struct Release(Arc<AtomicBool>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _release = Release(running);
         let result = check_latest_download_available();
         let available = result.is_ok();
         match result {
@@ -1579,27 +1731,57 @@ fn start_server_check(weak: slint::Weak<MainWindow>, running: Arc<AtomicBool>) {
             window.set_server_availability(if available { 1 } else { -1 });
             window.set_alternative_availability(alternative);
         });
-        running.store(false, Ordering::Release);
     });
 }
 
-fn verify_file(path: &Path, iso: &Iso) -> Result<bool, String> {
-    if fs::metadata(path).map_err(|e| e.to_string())?.len() != iso.size {
+/// Comprueba tamaño y MD5 de una ISO. Leer varios GB tarda, así que muestra el
+/// avance con `label` y, si se indica `cancel`, se detiene al cancelar la descarga.
+fn verify_file(
+    path: &Path,
+    iso: &Iso,
+    weak: &slint::Weak<MainWindow>,
+    label: &str,
+    cancel: Option<&AtomicU8>,
+) -> Result<bool, String> {
+    let length = fs::metadata(path)
+        .map_err(|e| file_error("comprobar ISO", path, e))?
+        .len();
+    if length != iso.size {
         return Ok(false);
     }
     let Some(expected) = &iso.md5 else {
         return Ok(true);
     };
-    let mut input = File::open(path).map_err(|e| e.to_string())?;
+    status(weak.clone(), format!("{label}…"));
+    let mut input = File::open(path).map_err(|e| file_error("abrir ISO", path, e))?;
     let mut hash = md5::Context::new();
     let mut buffer = vec![0u8; 1024 * 1024];
+    let mut checked = 0u64;
+    let mut last_update = Instant::now();
     loop {
-        let len = input.read(&mut buffer).map_err(|e| e.to_string())?;
+        if let Some(cancel) = cancel {
+            check_download_cancellation(cancel)?;
+        }
+        let len = input
+            .read(&mut buffer)
+            .map_err(|e| file_error("leer ISO", path, e))?;
         if len == 0 {
             break;
         }
         hash.consume(&buffer[..len]);
+        checked += len as u64;
+        if last_update.elapsed() >= Duration::from_millis(250) {
+            let message = format!("{label} · {} / {}", human(checked), human(iso.size));
+            let fraction = (checked as f64 / iso.size as f64).clamp(0.0, 1.0) as f32;
+            ui(weak.clone(), move |window| {
+                window.set_status_text(message.into());
+                window.set_progress(fraction);
+            });
+            last_update = Instant::now();
+        }
     }
+    // La barra vuelve a cero para la fase siguiente (descarga o copia al USB).
+    ui(weak.clone(), |window| window.set_progress(0.0));
     Ok(format!("{:x}", hash.compute()).eq_ignore_ascii_case(expected))
 }
 
@@ -1778,6 +1960,49 @@ fn unused_iso_path(root: &Path, name: &str) -> PathBuf {
     unreachable!()
 }
 
+// Prefijo de la copia temporal de la ISO en el USB, común a ambas plataformas.
+const USB_COPY_PREFIX: &str = ".winslim-copy-";
+
+fn usb_copy_temp_path(root: &Path) -> Result<PathBuf, String> {
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    Ok(root.join(format!(
+        "{USB_COPY_PREFIX}{}-{nanos}.part",
+        std::process::id()
+    )))
+}
+
+/// Borra copias temporales que quedaron en el USB al cerrar la aplicación o
+/// desconectar la unidad en mitad de una copia; pueden ocupar una ISO entera.
+fn remove_stale_usb_copies(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(USB_COPY_PREFIX)
+            || !name.ends_with(".part")
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_file(&path) {
+            Ok(()) => log_event(format!(
+                "INFO etapa=limpiar_usb copia_temporal_eliminada={}",
+                path.display()
+            )),
+            Err(error) => log_event(format!(
+                "WARNING etapa=limpiar_usb ruta={} detalle={error}",
+                path.display()
+            )),
+        }
+    }
+}
+
 fn copy_with_progress(
     from: &Path,
     to: &Path,
@@ -1799,6 +2024,45 @@ fn copy_with_progress(
     })
 }
 
+const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+// Alineación válida para leer sin caché en sectores de 512 B y de 4 KiB.
+const UNCACHED_ALIGNMENT: usize = 4096;
+
+/// Calcula el MD5 de la copia escrita en el USB. Con `uncached`, la lectura
+/// evita la caché del sistema (ver `open_uncached` en cada plataforma).
+fn read_back_md5(
+    path: &Path,
+    uncached: bool,
+    progress: &mut impl FnMut(u64),
+) -> std::io::Result<(u64, md5::Digest)> {
+    let mut file = if uncached {
+        open_uncached(path)?
+    } else {
+        File::open(path)?
+    };
+    let length = file.metadata()?.len();
+    let mut storage = vec![0u8; CHUNK_SIZE + UNCACHED_ALIGNMENT];
+    let offset = storage
+        .as_ptr()
+        .align_offset(UNCACHED_ALIGNMENT)
+        .min(UNCACHED_ALIGNMENT);
+    let buffer = &mut storage[offset..offset + CHUNK_SIZE];
+    let mut hash = md5::Context::new();
+    let mut total = 0u64;
+    // Se detiene al alcanzar el tamaño del archivo: sin caché, una lectura más
+    // tras el último bloque parcial partiría de una posición no alineada.
+    while total < length {
+        let len = file.read(buffer)?;
+        if len == 0 {
+            break;
+        }
+        hash.consume(&buffer[..len]);
+        total += len as u64;
+        progress(total);
+    }
+    Ok((total, hash.compute()))
+}
+
 fn copy_and_verify(
     from: &Path,
     to: &Path,
@@ -1810,7 +2074,6 @@ fn copy_and_verify(
         .create_new(true)
         .open(to)
         .map_err(|e| file_error("crear copia temporal USB", to, e))?;
-    const CHUNK_SIZE: usize = 8 * 1024 * 1024;
     // Dos bloques reutilizables permiten leer la ISO mientras el USB escribe.
     let (free_tx, free_rx) = mpsc::sync_channel::<Vec<u8>>(2);
     let (filled_tx, filled_rx) = mpsc::sync_channel::<Result<(Vec<u8>, usize), String>>(2);
@@ -1888,25 +2151,29 @@ fn copy_and_verify(
         started.elapsed().as_secs()
     ));
     progress(0, true);
-    let mut copied_file = File::open(to).map_err(|e| file_error("abrir copia USB", to, e))?;
-    let mut hash = md5::Context::new();
-    let mut buffer = vec![0u8; CHUNK_SIZE];
-    let mut verified = 0u64;
-    loop {
-        let len = copied_file
-            .read(&mut buffer)
-            .map_err(|e| file_error("verificar copia USB", to, e))?;
-        if len == 0 {
-            break;
-        }
-        hash.consume(&buffer[..len]);
-        verified += len as u64;
+    let mut report = |verified: u64| {
         if last_update.elapsed() >= Duration::from_millis(250) {
             progress(verified, true);
             last_update = Instant::now();
         }
-    }
-    if verified != total || hash.compute() != source_hash.1 {
+    };
+    // Se lee del USB sin la caché del sistema: si no, casi toda la ISO recién
+    // escrita saldría de la RAM y un pendrive defectuoso o de capacidad falsa
+    // pasaría la verificación.
+    let (verified, digest) = match read_back_md5(to, true, &mut report) {
+        Ok(result) => result,
+        // Windows exige alineación de sector al leer sin caché; si la unidad la
+        // rechaza, se repite con lectura normal para no bloquear la preparación.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            log_event(format!(
+                "WARNING etapa=verificar_copia_iso lectura_sin_cache_no_disponible detalle={error}"
+            ));
+            read_back_md5(to, false, &mut report)
+                .map_err(|e| file_error("verificar copia USB", to, e))?
+        }
+        Err(error) => return Err(file_error("verificar copia USB", to, error)),
+    };
+    if verified != total || digest != source_hash.1 {
         return Err(
             "La verificación de la ISO en el USB falló; vuelve a preparar la unidad".into(),
         );
@@ -1921,7 +2188,12 @@ fn copy_and_verify(
 }
 
 fn main() -> Result<(), slint::PlatformError> {
-    std::panic::set_hook(Box::new(|info| log_event(format!("ERROR panic={info}"))));
+    // Se conserva el gestor por defecto para seguir viendo el pánico en la consola de depuración.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log_event(format!("ERROR panic={info}"));
+        default_panic_hook(info);
+    }));
     log_event(format!(
         "INFO evento=inicio version={} sistema={} arquitectura={}",
         env!("CARGO_PKG_VERSION"),
@@ -2010,6 +2282,34 @@ fn main() -> Result<(), slint::PlatformError> {
     window.on_close_app(|| {
         let _ = slint::quit_event_loop();
     });
+    // Cerrar durante una descarga o la preparación del USB la interrumpe a medias:
+    // se pide confirmación en vez de cerrar directamente.
+    {
+        let weak = window.as_weak();
+        window.window().on_close_requested(move || {
+            let Some(window) = weak.upgrade() else {
+                return slint::CloseRequestResponse::HideWindow;
+            };
+            if window.get_download_active() || window.get_preparing() {
+                window.set_close_confirm_visible(true);
+                slint::CloseRequestResponse::KeepWindowShown
+            } else {
+                slint::CloseRequestResponse::HideWindow
+            }
+        });
+    }
+    window.on_confirm_close(|| {
+        log_event("WARNING evento=cierre_confirmado_con_operacion_en_curso".into());
+        let _ = slint::quit_event_loop();
+    });
+    {
+        let weak = window.as_weak();
+        window.on_cancel_close(move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_close_confirm_visible(false);
+            }
+        });
+    }
     {
         let weak = window.as_weak();
         window.on_restart_to_usb(move || {
@@ -2038,14 +2338,24 @@ fn main() -> Result<(), slint::PlatformError> {
     let log_timer = Timer::default();
     {
         let weak = window.as_weak();
+        // Tamaño y fecha del registro en la última lectura: si no cambian, no se relee.
+        let mut last_seen = None;
         log_timer.start(TimerMode::Repeated, Duration::from_millis(700), move || {
-            if let Some(w) = weak.upgrade() {
-                if w.get_logs_visible() {
-                    let contents = read_log();
-                    if w.get_log_text().as_str() != contents {
-                        w.set_log_text(contents.into());
-                    }
-                }
+            let Some(w) = weak.upgrade() else { return };
+            if !w.get_logs_visible() {
+                last_seen = None;
+                return;
+            }
+            let current = log_path()
+                .and_then(|path| fs::metadata(path).ok())
+                .map(|metadata| (metadata.len(), metadata.modified().ok()));
+            if current.is_some() && current == last_seen {
+                return;
+            }
+            last_seen = current;
+            let contents = read_log();
+            if w.get_log_text().as_str() != contents {
+                w.set_log_text(contents.into());
             }
         });
     }
@@ -2055,7 +2365,9 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = window.as_weak();
         let running = Arc::new(AtomicBool::new(false));
         start_server_check(weak.clone(), running.clone());
-        server_timer.start(TimerMode::Repeated, Duration::from_secs(180), move || {
+        // Cada comprobación consulta el RSS, el enlace de descarga y un espejo;
+        // diez minutos bastan para el indicador sin cargar a SourceForge.
+        server_timer.start(TimerMode::Repeated, Duration::from_secs(600), move || {
             if weak.upgrade().is_some_and(|window| !window.get_busy()) {
                 start_server_check(weak.clone(), running.clone());
             }
@@ -2099,12 +2411,9 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = window.as_weak();
         window.on_clear_logs(move || {
-            if let Some(path) = log_path() {
-                if let Err(e) = fs::write(&path, "") {
-                    log_event(format!("ERROR etapa=registro limpiar={e}"));
-                } else {
-                    log_event("INFO etapa=registro limpiado_por_usuario".into());
-                }
+            match clear_log() {
+                Ok(()) => log_event("INFO etapa=registro limpiado_por_usuario".into()),
+                Err(e) => log_event(format!("ERROR etapa=registro limpiar={e}")),
             }
             if let Some(w) = weak.upgrade() {
                 w.set_log_text(read_log().into());
@@ -2124,7 +2433,7 @@ fn main() -> Result<(), slint::PlatformError> {
             };
             let result = log_path()
                 .ok_or_else(|| "No se encontró el directorio del registro".to_owned())
-                .and_then(|source| fs::copy(source, &target).map_err(|e| e.to_string()));
+                .and_then(|source| export_log(&source, &target));
             if let Some(w) = weak.upgrade() {
                 match result {
                     Ok(_) => {
@@ -2157,9 +2466,10 @@ fn main() -> Result<(), slint::PlatformError> {
             let weak = weak.clone();
             let state = state.clone();
             thread::spawn(move || {
+                let _guard = PanicGuard::new(&weak, &state, None);
                 let result = fetch_latest();
                 if let Ok(iso) = &result {
-                    let mut current = state.lock().unwrap();
+                    let mut current = lock_state(&state);
                     let retained = if current.iso.as_ref().is_some_and(|previous| {
                         previous.url == iso.url
                             && previous.name == iso.name
@@ -2230,6 +2540,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let state = state.clone();
             let download_state = download_state.clone();
             thread::spawn(move || {
+                let _guard = PanicGuard::new(&weak, &state, Some(&download_state));
                 let result = match fetch_latest() {
                     Ok(iso) => {
                         if download_state.load(Ordering::Acquire) == DOWNLOAD_RUNNING {
@@ -2248,7 +2559,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 };
                 if let Ok((iso, path)) = &result {
                     {
-                        let mut current = state.lock().unwrap();
+                        let mut current = lock_state(&state);
                         current.iso = Some(iso.clone());
                         current.local_iso = Some(path.clone());
                         current.selected = None;
@@ -2291,11 +2602,12 @@ fn main() -> Result<(), slint::PlatformError> {
             download_state.store(DOWNLOAD_RUNNING, Ordering::Release);
             window.set_download_active(true);
             window.set_download_cancelling(false);
-            let iso = state.lock().unwrap().iso.clone();
+            let iso = lock_state(&state).iso.clone();
             let weak = weak.clone();
             let state = state.clone();
             let download_state = download_state.clone();
             thread::spawn(move || {
+                let _guard = PanicGuard::new(&weak, &state, Some(&download_state));
                 let result = iso
                     .ok_or("Busca primero una ISO".to_owned())
                     .and_then(|iso| {
@@ -2303,7 +2615,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     });
                 if let Ok((iso, path)) = &result {
                     {
-                        let mut current = state.lock().unwrap();
+                        let mut current = lock_state(&state);
                         current.local_iso = Some(path.clone());
                         current.selected = None;
                     }
@@ -2341,6 +2653,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let weak = weak.clone();
             let state = state.clone();
             thread::spawn(move || {
+                let _guard = PanicGuard::new(&weak, &state, None);
                 let result = fetch_available_alternative_link();
                 let alternative = if result.is_ok() { 1 } else { -1 };
                 ui(weak.clone(), move |window| {
@@ -2365,7 +2678,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state.clone();
         window.on_load_local_iso(move || {
             let Some(window) = weak.upgrade() else { return };
-            if state.lock().unwrap().busy {
+            if lock_state(&state).busy {
                 return;
             }
             let Some(path) = rfd::FileDialog::new()
@@ -2410,7 +2723,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 published: 0,
             };
             {
-                let mut current = state.lock().unwrap();
+                let mut current = lock_state(&state);
                 current.iso = Some(iso);
                 current.local_iso = Some(path.clone());
                 current.selected = None;
@@ -2445,11 +2758,15 @@ fn main() -> Result<(), slint::PlatformError> {
             let weak = weak.clone();
             let state = state.clone();
             thread::spawn(move || {
+                let _guard = PanicGuard::new(&weak, &state, None);
                 let result = disks();
                 if let Ok(disks) = &result {
                     let rows = disk_rows(disks);
-                    state.lock().unwrap().disks = disks.clone();
-                    state.lock().unwrap().selected = None;
+                    {
+                        let mut current = lock_state(&state);
+                        current.disks = disks.clone();
+                        current.selected = None;
+                    }
                     ui(weak.clone(), move |w| {
                         w.set_disks(ModelRc::new(VecModel::from(rows)));
                         w.set_selected_disk(-1);
@@ -2471,7 +2788,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = window.as_weak();
         window.on_select_disk(move |number| {
             let reuse = {
-                let mut state = state.lock().unwrap();
+                let mut state = lock_state(&state);
                 state.selected = Some(number as u32);
                 state
                     .disks
@@ -2493,7 +2810,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state.clone();
         window.on_request_prepare(move |force_reinstall| {
             let Some(window) = weak.upgrade() else { return };
-            let state = state.lock().unwrap();
+            let mut state = lock_state(&state);
             if state.iso.is_none() || state.local_iso.is_none() {
                 window.set_status_text("Descarga o carga una ISO antes de preparar el USB".into());
                 return;
@@ -2520,12 +2837,15 @@ fn main() -> Result<(), slint::PlatformError> {
             window.set_reuse_ventoy(reuse);
             window.set_confirm_reinstall(force_reinstall);
             window.set_confirm_disk(disk_label(disk).into());
+            state.confirming = Some(number);
             window.set_confirm_visible(true);
         });
     }
     {
         let weak = window.as_weak();
+        let state = state.clone();
         window.on_cancel_prepare(move || {
+            lock_state(&state).confirming = None;
             if let Some(w) = weak.upgrade() {
                 w.set_confirm_visible(false);
             }
@@ -2537,28 +2857,36 @@ fn main() -> Result<(), slint::PlatformError> {
         window.on_confirm_prepare(move || {
             let Some(window) = weak.upgrade() else { return };
             window.set_confirm_visible(false);
+            let confirmed = lock_state(&state).confirming.take();
             if !begin(&state, &window) {
                 return;
             }
+            window.set_preparing(true);
             let gpt = window.get_gpt();
             let ntfs = window.get_ntfs();
             let reuse_expected = window.get_reuse_ventoy();
             let force_reinstall = window.get_confirm_reinstall();
             let snapshot = {
-                let state = state.lock().unwrap();
-                (
-                    state
-                        .selected
-                        .and_then(|n| state.disks.iter().find(|d| d.number == n).cloned()),
-                    state.iso.clone(),
-                    state.local_iso.clone(),
-                )
+                let state = lock_state(&state);
+                // Se prepara exactamente el disco que mostraba la confirmación.
+                let disk = match confirmed {
+                    Some(number) if state.selected == Some(number) => state
+                        .disks
+                        .iter()
+                        .find(|d| d.number == number)
+                        .cloned()
+                        .ok_or("El USB confirmado ya no está en la lista. Actualízala y vuelve a elegirlo."),
+                    _ => Err("La selección del USB cambió después de la confirmación. No se ha modificado ninguna unidad; vuelve a pulsar Preparar."),
+                };
+                (disk, state.iso.clone(), state.local_iso.clone())
             };
             let weak = weak.clone();
             let state = state.clone();
             thread::spawn(move || {
+                let _guard = PanicGuard::new(&weak, &state, None);
                 let result = match snapshot {
-                    (Some(disk), Some(iso), Some(path)) => prepare(
+                    (Err(error), _, _) => Err(error.to_owned()),
+                    (Ok(disk), Some(iso), Some(path)) => prepare(
                         disk,
                         iso,
                         path,
@@ -2575,7 +2903,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     match disks() {
                         Ok(updated) => {
                             let rows = disk_rows(&updated);
-                            let mut current = state.lock().unwrap();
+                            let mut current = lock_state(&state);
                             current.disks = updated;
                             current.selected = None;
                             ui(weak.clone(), move |window| {
@@ -2588,7 +2916,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             log_event(format!(
                                 "ERROR etapa=actualizar_usb_tras_copia detalle={error}"
                             ));
-                            let mut current = state.lock().unwrap();
+                            let mut current = lock_state(&state);
                             current.disks.clear();
                             current.selected = None;
                             ui(weak.clone(), move |window| {
@@ -3142,6 +3470,146 @@ mod tests {
           <item><title>/other.txt</title><link>https://sourceforge.net/projects/winslim11-isos/files/other.txt/download</link><pubDate>Fri, 25 Sep 2026 00:09:08 GMT</pubDate><media:content filesize="9311354880"/></item>
         </channel></rss>"#;
         assert_eq!(parse_latest(xml).unwrap().name, "WinSlim11_new.iso");
+    }
+
+    #[test]
+    fn latest_iso_ignores_subfolders_and_requires_md5_algorithm() {
+        let xml = r#"<rss xmlns:media="http://video.search.yahoo.com/mrss/"><channel>
+          <item><title>/WinSlim11_root.iso</title><link>https://sourceforge.net/projects/winslim11-isos/files/WinSlim11_root.iso/download</link><pubDate>Wed, 23 Sep 2026 00:09:08 UT</pubDate><media:content filesize="9311354880"><media:hash algo="sha1">0123456789abcdef0123456789abcdef01234567</media:hash><media:hash algo="md5">4B7EE2A61AEC7E5BB0C1ACC19FC3A80D</media:hash></media:content></item>
+          <item><title>/.rsync-partial/WinSlim11_partial.iso</title><link>https://sourceforge.net/projects/winslim11-isos/files/.rsync-partial/WinSlim11_partial.iso/download</link><pubDate>Thu, 24 Sep 2026 00:09:08 UT</pubDate><media:content filesize="9311354880"/></item>
+        </channel></rss>"#;
+        let iso = parse_latest(xml).unwrap();
+        assert_eq!(iso.name, "WinSlim11_root.iso");
+        assert_eq!(iso.md5.as_deref(), Some("4B7EE2A61AEC7E5BB0C1ACC19FC3A80D"));
+        let sha1_only = xml.replace(
+            r#"<media:hash algo="md5">4B7EE2A61AEC7E5BB0C1ACC19FC3A80D</media:hash>"#,
+            "",
+        );
+        assert_eq!(parse_latest(&sha1_only).unwrap().md5, None);
+    }
+
+    #[test]
+    fn uncached_read_back_hashes_whole_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "winslim-uncached-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("copy.iso");
+        // Tamaño no múltiplo del sector para comprobar el último bloque parcial.
+        let data: Vec<u8> = (0usize..(CHUNK_SIZE * 2 + 4097))
+            .map(|index| (index.wrapping_mul(31) % 253) as u8)
+            .collect();
+        fs::write(&path, &data).unwrap();
+        let mut last = 0;
+        let mut report = |read: u64| last = read;
+        let (length, digest) = read_back_md5(&path, true, &mut report).unwrap();
+        assert_eq!(length, data.len() as u64);
+        assert_eq!(last, data.len() as u64);
+        assert_eq!(digest, md5::compute(&data));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_usb_copies_are_removed_without_touching_other_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "winslim-stale-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let stale = usb_copy_temp_path(&dir).unwrap();
+        fs::write(&stale, b"copia interrumpida").unwrap();
+        let kept = [
+            dir.join("WinSlim11.iso"),
+            dir.join(".winslim-copy-notas.txt"),
+            dir.join("otra.part"),
+        ];
+        for path in &kept {
+            fs::write(path, b"conservar").unwrap();
+        }
+        remove_stale_usb_copies(&dir);
+        assert!(!stale.exists());
+        assert!(kept.iter().all(|path| path.exists()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn md5_mismatch_discards_the_downloaded_file() {
+        let data = vec![7u8; 128 * 1024];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_data = data.clone();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            // Petición 0: resolver el enlace; petición 1: la descarga completa.
+            for request_number in 0..2 {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "faltó una petición HTTP de prueba"
+                            );
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("servidor de prueba: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    server_data.len()
+                )
+                .unwrap();
+                if request_number == 1 {
+                    stream.write_all(&server_data).unwrap();
+                }
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "winslim-md5-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let iso = Iso {
+            name: "mismatch.iso".into(),
+            url: format!("http://{address}/mismatch.iso"),
+            size: data.len() as u64,
+            md5: Some("0".repeat(32)),
+            published: 0,
+        };
+        let download_state = AtomicU8::new(DOWNLOAD_RUNNING);
+        let error =
+            download_iso_to(&iso, slint::Weak::default(), &dir, &download_state).unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("MD5"), "{error}");
+        assert!(!dir.join("mismatch.iso.part").exists());
+        assert!(!dir.join("mismatch.iso").exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

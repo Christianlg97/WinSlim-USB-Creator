@@ -60,7 +60,7 @@ flowchart TD
         FRS["SourceForge Storage Server\nfrs.sourceforge.net\n/home/frs/project/winslim11-isos/"]
         MIRRORS["Red Global de Réplicas (Mirrors CDN)\ndownloads.sourceforge.net"]
         
-        CYG -- "Rsync over SSH\n(-avhP --append-verify)" --> FRS
+        CYG -- "Rsync over SSH\n(-avhP --partial-dir)" --> FRS
         FRS --> MIRRORS
     end
 
@@ -146,7 +146,7 @@ La subida de archivos de ~9.3 GB a través de redes WAN requiere un protocolo co
 ```bat
 "%CYG_BIN%\rsync.exe" ^
     -avhP ^
-    --append-verify ^
+    --partial-dir=.rsync-partial ^
     --protect-args ^
     -e "/usr/bin/ssh" ^
     "%ISO_POSIX%" ^
@@ -160,7 +160,7 @@ La subida de archivos de ~9.3 GB a través de redes WAN requiere un protocolo co
 | `-v` (`--verbose`) | Detalle informativo en pantalla. | Monitoreo en tiempo real del progreso. |
 | `-h` (`--human-readable`) | Formato de unidades legibles (MB, GB, KB/s). | Claridad visual del rendimiento de subida. |
 | `-P` | Combina `--progress` y `--partial`. | Si la conexión se interrumpe al 80%, el archivo parcial no se descarta. |
-| `--append-verify` | **Crucial:** Reanuda la transferencia desde el último byte exacto y verifica checksums de datos previos. | Ahorra horas de resubida ante cortes de red o reinicios. |
+| `--partial-dir=.rsync-partial` | **Crucial:** Guarda la transferencia interrumpida en la carpeta oculta `.rsync-partial` del servidor y la usa como base al reanudar; rsync verifica la suma de todo el archivo al terminar. | La ISO solo aparece con su nombre definitivo cuando está completa, así que nunca se publica (ni la descarga la aplicación) una ISO a medias. |
 | `--protect-args` | Previene que el shell remoto interprete espacios o caracteres especiales en el nombre. | Compatibilidad garantizada con nombres complejos de compilación. |
 | `-e "/usr/bin/ssh"` | Canaliza el flujo a través del cliente OpenSSH de Cygwin. | Cifrado seguro y autenticación estándar por claves SSH o contraseña. |
 
@@ -177,7 +177,7 @@ WinSlim11 _ ESx64 _ R1.5 _ P-2.2.2 _ 240926 _ Rev62 _ DEV .iso
    │         │       │        │        │       │       │
    │         │       │        │        │       │       └── Rama / Canal (DEV / RELEASE)
    │         │       │        │        │       └────────── Revisión interna del build engine
-   │         │       │        │        └────────────────── Fecha de compilación (YYMMDD: 24 Sep 2026)
+   │         │       │        │        └────────────────── Fecha de compilación (DDMMYY: 24 Sep 2026)
    │         │       │        └─────────────────────────── Perfil de optimización WinSlim (Preset v2.2.2)
    │         │       └──────────────────────────────────── Versión mayor/menor de WinSlim11 (Release 1.5)
    │         └──────────────────────────────────────────── Idioma (Español) y Arquitectura (x64 / AMD64)
@@ -300,7 +300,7 @@ sequenceDiagram
 
 ### 3. Transferencia interrumpida a mitad de camino
 * **Causa:** Microcortes de ISP, cierre accidental o suspensión del equipo.
-* **Solución:** Simplemente vuelve a ejecutar el script. Gracias a las banderas `-P` y `--append-verify`, `rsync` comprobará los bloques ya subidos y continuará exactamente desde el punto de interrupción.
+* **Solución:** Simplemente vuelve a ejecutar el script. Gracias a `-P` y `--partial-dir=.rsync-partial`, `rsync` reutiliza lo ya subido y solo envía lo que falta. Al reanudar, antes de continuar compara por bloques la parte guardada en el servidor, así que puede tardar unos minutos en reanudar el progreso.
 
 ### 4. `No se encontró ninguna ISO`
 * **Causa:** El archivo `.iso` no se encuentra en la misma carpeta que el script `SourceForge_Upload_ISO.cmd`.
@@ -312,11 +312,15 @@ sequenceDiagram
 
 ```text
 WinSlim11_ISOS/
-├── .gitattributes             # Configuración de políticas Git LFS de resguardo
-├── .gitignore                 # Exclusión estricta de binarios *.iso de Git
-├── README.md                  # Documentación maestra y especificaciones técnicas
-├── SourceForge_Upload_ISO.cmd # Orquestador automatizado de subidas a SourceForge FRS
-└── WinSlim11_*.iso            # Imágenes ISO compiladas (almacenadas localmente / ignoradas en Git)
+├── .gitattributes               # Finales de línea y políticas Git LFS de resguardo
+├── .gitignore                   # Exclusión estricta de binarios *.iso de Git
+├── README.md                    # Documentación maestra y especificaciones técnicas
+├── BugTrack.txt                 # Mejoras y errores pendientes de la herramienta USB
+├── SourceForge_Upload_ISO.cmd   # Orquestador automatizado de subidas a SourceForge FRS
+├── Compilar-WinSlim.cmd         # Compila el .exe de Windows y, si WSL está listo, el AppImage
+├── Compilar-WinSlim-Windows.cmd # Compila solo el .exe de Windows
+├── WinSlimUsbCreator/           # Código fuente de WinSlim USB Creator (Rust + Slint)
+└── WinSlim11_*.iso              # Imágenes ISO compiladas (almacenadas localmente / ignoradas en Git)
 ```
 
 ### Política de Exclusiones Git

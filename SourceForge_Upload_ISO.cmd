@@ -1,4 +1,3 @@
-```bat
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul
@@ -595,8 +594,12 @@ rem
 rem -P
 rem   --partial + --progress
 rem
-rem --append-verify
-rem   Reutiliza una transferencia parcial y verifica los datos
+rem --partial-dir=.rsync-partial
+rem   Guarda una transferencia interrumpida en la carpeta oculta
+rem   .rsync-partial del servidor y la reutiliza al reanudar.
+rem   La ISO solo aparece con su nombre definitivo cuando esta
+rem   completa: --append-verify escribia directamente sobre el
+rem   nombre final y dejaba publicada una ISO a medias.
 rem
 rem --protect-args
 rem   Mejora el tratamiento de nombres con espacios/caracteres
@@ -604,7 +607,7 @@ rem ============================================================
 
 "%CYG_BIN%\rsync.exe" ^
     -avhP ^
-    --append-verify ^
+    --partial-dir=.rsync-partial ^
     --protect-args ^
     -e "/usr/bin/ssh" ^
     "%ISO_POSIX%" ^
@@ -658,4 +661,3 @@ echo Puedes cerrarla manualmente cuando termines.
 echo.
 
 endlocal
-```
