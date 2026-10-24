@@ -8,7 +8,7 @@ Los textos de la interfaz usan [Ubuntu Sans v1.006 de Canonical](https://github.
 
 ## Compilar con un doble clic
 
-Ejecuta [Compilar-WinSlim.cmd](../Compilar-WinSlim.cmd) desde Windows. Primero genera `WinSlimUsbCreator\release\WinSlim-USB-Creator.exe` con MSVC. Después comprueba si WSL tiene una distribución Linux x86_64 operativa, las herramientas básicas y el paquete de Ventoy; si las tiene, genera también `WinSlimUsbCreator\release\WinSlim-USB-Creator-x86_64.AppImage`. Si WSL no está preparado, omite el AppImage y la compilación de Windows sigue siendo correcta. Para generar solo el `.exe`, utiliza [Compilar-WinSlim-Windows.cmd](../Compilar-WinSlim-Windows.cmd).
+Ejecuta [Compilar.cmd](../Compilar.cmd) desde Windows. Es el único lanzador CMD y genera `WinSlimUsbCreator\release\WinSlim-USB-Creator.exe` con MSVC. Acepta `--no-pause` para uso automatizado.
 
 En una máquina Linux nativa, ejecuta [scripts/build-linux.sh](scripts/build-linux.sh) para generar únicamente el AppImage. El mismo script se usa dentro de WSL cuando el CMD de Windows detecta que está listo. La carpeta `release` se genera localmente y está excluida de Git.
 
@@ -24,7 +24,7 @@ Para publicar una versión, sube el `.exe` y el `.AppImage` como archivos de Git
 - Los botones del paso 01 cambian según el estado: al inicio destaca la búsqueda; al localizar una ISO destacan la descarga directa y la alternativa, y buscar de nuevo o cargar un archivo local quedan como opciones secundarias. Con una ISO local o descargada, las acciones de cambio de origen son discretas. Durante la descarga aparece «Cancelar descarga», que conserva la ISO local seleccionada si no se completa el cambio. Con ancho suficiente los cuatro botones de la ISO localizada ocupan una fila; en ventanas estrechas se organizan en dos.
 - Consulta el RSS de archivos de SourceForge para elegir la ISO `WinSlim*.iso` con fecha de publicación más reciente. El nombre no está fijado en el código.
 - Tras localizar la última ISO, ofrece «Descarga directa de la ISO» en la aplicación y «Descarga alternativa de la ISO» en el navegador predeterminado. La segunda opción consulta al pulsarla las notas de la release [`Latest_Mirror_URL`](https://github.com/Christianlg97/WinSlim_Mirroring/releases/tag/Latest_Mirror_URL) de GitHub y abre el enlace HTTPS publicado allí; el enlace de descarga no está fijado en el código. Esa release debe mantenerse actualizada con la ISO correspondiente, ya que las notas actuales solo contienen un enlace y no permiten comprobar el nombre ni el tamaño del archivo antes de abrirlo.
-- Comprueba en segundo plano al abrir la ventana, y de nuevo cada diez minutos cuando está libre, si la ISO más reciente se puede obtener del servidor. Solo tiene en cuenta ISOs de la raíz del proyecto con MD5 publicado por SourceForge. El paso 01 muestra un indicador verde o rojo según el resultado y gris mientras se realiza la primera comprobación.
+- Comprueba en segundo plano al abrir la ventana, y de nuevo cada diez minutos cuando está libre, si la ISO más reciente se puede obtener del servidor. Usa una única petición parcial con tiempos de espera breves y acepta espejos descargables que omiten `Content-Length` o ignoran `Range`; si el servidor declara un tamaño, debe coincidir con el RSS. Solo tiene en cuenta ISOs de la raíz del proyecto con MD5 publicado por SourceForge. El paso 01 muestra un indicador verde o rojo según el resultado y gris mientras se realiza la primera comprobación.
 - Antes de iniciar una descarga consulta los espejos que SourceForge ofrece para esa ISO. Si hay varios, compara hasta ocho con una muestra de 512 KiB y usa el que responda más rápido; si solo hay uno o la consulta falla, conserva la selección automática de SourceForge. La velocidad de una muestra breve no garantiza la velocidad de toda la ISO.
 - Muestra el nombre y tamaño de la ISO en GiB, calculados con 1024³ bytes por GiB como en las propiedades de Windows. Descarga en `Descargas\WinSlim` con hasta cuatro conexiones y fragmentos de 32 MiB cuando SourceForge proporciona MD5 y el espejo confirma rangos HTTP; en los demás casos continúa con una conexión. Muestra progreso, velocidad y tiempo estimado, y verifica tamaño y MD5 con los datos publicados por SourceForge. Conserva el archivo `.part` para reanudar la descarga tras un corte; al cancelar elimina también los fragmentos temporales.
 - Detecta las unidades USB automáticamente al abrir la ventana y permite repetir la búsqueda con «Volver a detectar unidades». En Windows usa `Get-Disk`; en Linux usa `lsblk`. Muestra modelo, capacidad, ubicación y sistema de archivos y excluye los discos del sistema.
@@ -48,7 +48,7 @@ Para publicar una versión, sube el `.exe` y el `.AppImage` como archivos de Git
 
 ```powershell
 cd WinSlimUsbCreator
-..\Compilar-WinSlim.cmd --no-pause
+..\Compilar.cmd --no-pause
 .\release\WinSlim-USB-Creator.exe
 ```
 

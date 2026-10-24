@@ -66,6 +66,8 @@ const DOWNLOAD_SEGMENT_BYTES: u64 = 32 * 1024 * 1024;
 const PARALLEL_MIN_BYTES: u64 = 64 * 1024 * 1024;
 const MIRROR_PROBE_BYTES: u64 = 512 * 1024;
 const MAX_MIRROR_PROBES: usize = 8;
+const AVAILABILITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const AVAILABILITY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn check_download_cancellation(download_state: &AtomicU8) -> Result<(), String> {
     if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED {
@@ -424,9 +426,12 @@ fn begin(state: &Arc<Mutex<State>>, window: &MainWindow) -> bool {
 
 fn fetch_latest() -> Result<Iso, String> {
     log_event(format!("INFO etapa=consultar_iso url={RSS}"));
-    let response = ureq::get(RSS)
+    let response = ureq::builder()
+        .timeout_connect(AVAILABILITY_CONNECT_TIMEOUT)
+        .timeout_read(AVAILABILITY_READ_TIMEOUT)
+        .build()
+        .get(RSS)
         .set("User-Agent", "WinSlimUsbCreator/0.1")
-        .timeout(Duration::from_secs(25))
         .call()
         .map_err(|e| http_error("consultar RSS", e))?;
     log_event(format!(
@@ -1654,15 +1659,14 @@ fn resolve_download(iso: &Iso) -> Result<String, String> {
     Ok(url)
 }
 
-fn check_latest_download_available() -> Result<(), String> {
-    let iso = fetch_latest()?;
-    let url = resolve_download(&iso)?;
-    // Solo leemos el primer byte: la comprobación no descarga la ISO.
+fn check_download_available(iso: &Iso) -> Result<(), String> {
+    // La URL /download de SourceForge ya redirige al espejo. Resolverla con
+    // otra petición duplicaba la espera y podía probar un espejo diferente.
     let response = ureq::builder()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(10))
+        .timeout_connect(AVAILABILITY_CONNECT_TIMEOUT)
+        .timeout_read(AVAILABILITY_READ_TIMEOUT)
         .build()
-        .get(&url)
+        .get(&iso.url)
         .set("User-Agent", "WinSlimUsbCreator/0.1")
         .set("Accept-Encoding", "identity")
         .set("Range", "bytes=0-0")
@@ -1674,18 +1678,36 @@ fn check_latest_download_available() -> Result<(), String> {
     {
         return Err("El servidor devolvió una página HTML en lugar de la ISO".into());
     }
-    let correct_file = match response.status() {
-        206 => response.header("Content-Range") == Some(format!("bytes 0-0/{}", iso.size).as_str()),
+    // Algunos espejos ignoran Range o responden sin Content-Length al usar
+    // transferencia fragmentada. Eso no impide descargar: solo rechazamos el
+    // tamaño cuando el espejo lo declara y contradice los metadatos del RSS.
+    match response.status() {
+        206 => {
+            if let Some(total) = response
+                .header("Content-Range")
+                .and_then(|value| value.rsplit_once('/'))
+                .and_then(|(_, total)| total.parse::<u64>().ok())
+            {
+                if total != iso.size {
+                    return Err(
+                        "El servidor devolvió un tamaño de ISO distinto al publicado".into(),
+                    );
+                }
+            }
+        }
         200 => {
-            response
+            if let Some(length) = response
                 .header("Content-Length")
                 .and_then(|value| value.parse::<u64>().ok())
-                == Some(iso.size)
+            {
+                if length != iso.size {
+                    return Err(
+                        "El servidor devolvió un tamaño de ISO distinto al publicado".into(),
+                    );
+                }
+            }
         }
-        _ => false,
-    };
-    if !correct_file {
-        return Err("El servidor no confirmó el tamaño de la ISO publicada".into());
+        _ => return Err("El servidor no ofreció una descarga válida de la ISO".into()),
     }
     let mut reader = response.into_reader();
     let mut first_byte = [0u8; 1];
@@ -1697,6 +1719,11 @@ fn check_latest_download_available() -> Result<(), String> {
         return Err("El servidor no entregó datos de la ISO".into());
     }
     Ok(())
+}
+
+fn check_latest_download_available() -> Result<(), String> {
+    let iso = fetch_latest()?;
+    check_download_available(&iso)
 }
 
 fn start_server_check(weak: slint::Weak<MainWindow>, running: Arc<AtomicBool>) {
@@ -3013,6 +3040,56 @@ mod tests {
             parse_mirror_choices(html),
             vec!["netix".to_owned(), "master".to_owned()]
         );
+    }
+
+    #[test]
+    fn availability_accepts_downloadable_responses_without_strict_size_headers() {
+        for response in [
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nConnection: close\r\n\r\nX",
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nX",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..length]).contains("Range: bytes=0-0"));
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let iso = Iso {
+                name: "test.iso".into(),
+                url: format!("http://{address}/test.iso"),
+                size: 9_370_009_600,
+                md5: None,
+                published: 0,
+            };
+            check_download_available(&iso).unwrap();
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn availability_rejects_an_explicit_wrong_size() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nXX")
+                .unwrap();
+        });
+        let iso = Iso {
+            name: "test.iso".into(),
+            url: format!("http://{address}/test.iso"),
+            size: 3,
+            md5: None,
+            published: 0,
+        };
+        assert!(check_download_available(&iso).is_err());
+        server.join().unwrap();
     }
 
     #[test]

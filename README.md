@@ -317,8 +317,7 @@ WinSlim11_ISOS/
 ├── README.md                    # Documentación maestra y especificaciones técnicas
 ├── BugTrack.txt                 # Mejoras y errores pendientes de la herramienta USB
 ├── SourceForge_Upload_ISO.cmd   # Orquestador automatizado de subidas a SourceForge FRS
-├── Compilar-WinSlim.cmd         # Compila el .exe de Windows y, si WSL está listo, el AppImage
-├── Compilar-WinSlim-Windows.cmd # Compila solo el .exe de Windows
+├── Compilar.cmd                 # Único lanzador CMD; compila el .exe de Windows
 ├── WinSlimUsbCreator/           # Código fuente de WinSlim USB Creator (Rust + Slint)
 └── WinSlim11_*.iso              # Imágenes ISO compiladas (almacenadas localmente / ignoradas en Git)
 ```
