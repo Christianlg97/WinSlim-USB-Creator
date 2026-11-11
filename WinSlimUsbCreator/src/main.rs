@@ -662,9 +662,11 @@ fn disk_rows(disks: &[Disk]) -> Vec<DiskRow> {
             label: SharedString::from(disk_label(disk)),
             detail: SharedString::from(format!(
                 "USB · {}{}{}",
+                // Las particiones sin formato no deben dejar huecos («exFAT /  / FAT»).
                 disk.volumes
                     .iter()
                     .filter_map(|volume| volume.file_system.as_deref())
+                    .filter(|file_system| !file_system.is_empty())
                     .collect::<Vec<_>>()
                     .join(" / "),
                 disk.volumes
@@ -1082,6 +1084,10 @@ fn download_iso_to(
     download_state: &AtomicU8,
 ) -> Result<PathBuf, String> {
     let result = download_iso_to_inner(iso, weak, dir, download_state);
+    if let Ok(path) = &result {
+        // Todas las salidas correctas han comprobado tamaño y MD5.
+        remember_verified_iso(path, iso);
+    }
     if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED
         || result
             .as_ref()
@@ -1812,6 +1818,63 @@ fn verify_file(
     Ok(format!("{:x}", hash.compute()).eq_ignore_ascii_case(expected))
 }
 
+/// Última ISO con MD5 ya comprobado: ruta, tamaño, fecha de modificación y MD5.
+/// Preparar justo después de descargar (o repetir una preparación) no vuelve a
+/// leer varios GB; la copia al USB comprueba de todos modos el MD5 de origen.
+static VERIFIED_ISO: Mutex<Option<(PathBuf, u64, SystemTime, String)>> = Mutex::new(None);
+
+fn file_stamp(path: &Path) -> Option<(u64, SystemTime)> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+fn remember_verified_iso(path: &Path, iso: &Iso) {
+    let (Some(md5), Some((size, modified))) = (&iso.md5, file_stamp(path)) else {
+        return;
+    };
+    if size == iso.size {
+        *VERIFIED_ISO.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((path.to_path_buf(), size, modified, md5.clone()));
+    }
+}
+
+fn iso_recently_verified(path: &Path, iso: &Iso) -> bool {
+    let Some(md5) = &iso.md5 else {
+        return false;
+    };
+    let stamp = file_stamp(path);
+    VERIFIED_ISO
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|(verified, size, modified, hash)| {
+            verified == path
+                && *size == iso.size
+                && hash.eq_ignore_ascii_case(md5)
+                && stamp == Some((*size, *modified))
+        })
+}
+
+/// Comprueba la ISO antes de tocar el USB (antes de formatear nada).
+fn verify_iso_for_usb(
+    path: &Path,
+    iso: &Iso,
+    weak: &slint::Weak<MainWindow>,
+) -> Result<(), String> {
+    if iso_recently_verified(path, iso) {
+        log_event(format!(
+            "INFO etapa=verificar_iso verificacion_previa_reutilizada ruta={}",
+            path.display()
+        ));
+        return Ok(());
+    }
+    if !verify_file(path, iso, weak, "Comprobando la integridad de la ISO", None)? {
+        return Err("La ISO local no coincide con SourceForge. Descárgala de nuevo.".into());
+    }
+    remember_verified_iso(path, iso);
+    Ok(())
+}
+
 fn format_duration(seconds: u64) -> String {
     if seconds >= 3600 {
         format!("{} h {} min", seconds / 3600, seconds % 3600 / 60)
@@ -2033,10 +2096,11 @@ fn remove_stale_usb_copies(root: &Path) {
 fn copy_with_progress(
     from: &Path,
     to: &Path,
-    total: u64,
+    iso: &Iso,
     weak: slint::Weak<MainWindow>,
 ) -> Result<(), String> {
-    copy_and_verify(from, to, total, |copied, verifying| {
+    let total = iso.size;
+    copy_and_verify(from, to, total, iso.md5.as_deref(), |copied, verifying| {
         let label = if verifying {
             "Verificando ISO"
         } else {
@@ -2090,10 +2154,13 @@ fn read_back_md5(
     Ok((total, hash.compute()))
 }
 
+/// Copia `from` en `to` y lo verifica releyendo el destino. Con `expected_md5`,
+/// el MD5 calculado al leer el origen también debe coincidir con el publicado.
 fn copy_and_verify(
     from: &Path,
     to: &Path,
     total: u64,
+    expected_md5: Option<&str>,
     mut progress: impl FnMut(u64, bool),
 ) -> Result<(), String> {
     let mut target = OpenOptions::new()
@@ -2167,10 +2234,28 @@ fn copy_and_verify(
         write_result?;
         source_result
     })?;
-    target.sync_all().map_err(|e| e.to_string())?;
+    target
+        .sync_all()
+        .map_err(|e| file_error("sincronizar copia USB", to, e))?;
     drop(target);
     if copied != total || source_hash.0 != total {
         return Err("La copia al USB quedó incompleta".into());
+    }
+    if let Some(expected) = expected_md5 {
+        let actual = format!("{:x}", source_hash.1);
+        if !actual.eq_ignore_ascii_case(expected) {
+            log_event(format!(
+                "ERROR etapa=copiar_iso md5_origen_esperado={expected} md5_origen_leido={actual}"
+            ));
+            let mut verified = VERIFIED_ISO.lock().unwrap_or_else(PoisonError::into_inner);
+            if verified.as_ref().is_some_and(|(path, ..)| path == from) {
+                *verified = None;
+            }
+            drop(verified);
+            return Err(
+                "La ISO de origen cambió o está dañada (MD5 distinto). Descárgala de nuevo.".into(),
+            );
+        }
     }
     log_event(format!(
         "INFO etapa=copiar_iso bytes={} segundos={}",
@@ -3025,6 +3110,37 @@ mod tests {
     }
 
     #[test]
+    fn verified_iso_is_reused_only_while_the_file_is_unchanged() {
+        let path = std::env::temp_dir().join(format!(
+            "winslim-verified-{}-{}.iso",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"contenido").unwrap();
+        let iso = Iso {
+            name: "WinSlim.iso".into(),
+            url: String::new(),
+            size: 9,
+            md5: Some(format!("{:x}", md5::compute(b"contenido"))),
+            published: 0,
+        };
+        assert!(!iso_recently_verified(&path, &iso));
+        remember_verified_iso(&path, &iso);
+        assert!(iso_recently_verified(&path, &iso));
+        let other = Iso {
+            md5: Some("0".repeat(32)),
+            ..iso.clone()
+        };
+        assert!(!iso_recently_verified(&path, &other));
+        fs::write(&path, b"contenido extra").unwrap();
+        assert!(!iso_recently_verified(&path, &iso));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn iso_size_uses_binary_gib_like_windows_properties() {
         assert_eq!(human(9_311_354_880), "8,67 GiB");
         assert_eq!(human(1_048_576), "1,0 MiB");
@@ -3442,10 +3558,12 @@ mod tests {
             .collect();
         fs::write(&source, &data).unwrap();
         let mut finished = false;
+        let expected = format!("{:x}", md5::compute(&data));
         copy_and_verify(
             &source,
             &destination,
             data.len() as u64,
+            Some(&expected),
             |copied, verifying| {
                 if verifying && copied == data.len() as u64 {
                     finished = true;
@@ -3455,8 +3573,19 @@ mod tests {
         .unwrap();
         assert!(finished);
         assert_eq!(fs::read(&destination).unwrap(), data);
-        assert!(copy_and_verify(&source, &destination, data.len() as u64, |_, _| {}).is_err());
+        assert!(
+            copy_and_verify(&source, &destination, data.len() as u64, None, |_, _| {}).is_err()
+        );
         assert_eq!(fs::read(&destination).unwrap(), data);
+        let wrong_hash = dir.join("wrong-hash.iso");
+        assert!(copy_and_verify(
+            &source,
+            &wrong_hash,
+            data.len() as u64,
+            Some("00000000000000000000000000000000"),
+            |_, _| {}
+        )
+        .is_err());
         let existing = dir.join("existing.iso");
         fs::write(&existing, b"original").unwrap();
         assert!(publish_iso(&destination, &existing).is_err());
@@ -3482,11 +3611,17 @@ mod tests {
         let destination = dir.join("destination.iso");
         let data = vec![0x5a; 1024];
         fs::write(&source, &data).unwrap();
-        copy_and_verify(&source, &destination, data.len() as u64, |_, verifying| {
-            if !verifying {
-                thread::sleep(Duration::from_millis(50));
-            }
-        })
+        copy_and_verify(
+            &source,
+            &destination,
+            data.len() as u64,
+            None,
+            |_, verifying| {
+                if !verifying {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            },
+        )
         .unwrap();
         assert_eq!(fs::read(&destination).unwrap(), data);
         fs::remove_dir_all(dir).unwrap();
@@ -3720,7 +3855,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn local_iso_on_target_usb_is_rejected() {
         let disk = Disk {
-            number: 5,
+            number: 999,
             device_path: None,
             friendly_name: "USB".into(),
             serial_number: None,
@@ -3789,6 +3924,33 @@ mod tests {
     #[ignore = "depends on Windows disk inventory"]
     fn usb_enumeration_is_readable() {
         let found = disks().unwrap();
-        assert!(found.iter().all(|disk| disk.bus_type == "USB"));
+        for disk in &found {
+            println!("{}", disk_label(disk));
+            for volume in &disk.volumes {
+                println!(
+                    "    particion={} letra={:?} etiqueta={:?} fs={:?} bytes={}",
+                    volume.partition_number,
+                    volume.letter,
+                    volume.label,
+                    volume.file_system,
+                    volume.size
+                );
+            }
+            println!(
+                "    serie={:?} solo_lectura={} ventoy={:?}",
+                disk.serial_number,
+                disk.is_read_only,
+                ventoy_data_location(disk)
+            );
+        }
+        assert!(found
+            .iter()
+            .all(|disk| disk.bus_type == "USB" && !disk.is_boot && !disk.is_system));
+        let again = disks().unwrap();
+        assert_eq!(found.len(), again.len());
+        assert!(found
+            .iter()
+            .zip(&again)
+            .all(|(first, second)| same_disk(first, second)));
     }
 }

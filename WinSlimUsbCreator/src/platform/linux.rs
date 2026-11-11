@@ -453,15 +453,7 @@ pub(super) fn prepare(
     force_reinstall: bool,
     weak: slint::Weak<MainWindow>,
 ) -> Result<String, String> {
-    if !verify_file(
-        &local_iso,
-        &iso,
-        &weak,
-        "Comprobando la integridad de la ISO",
-        None,
-    )? {
-        return Err("La ISO local no coincide con SourceForge. Descárgala de nuevo.".into());
-    }
+    verify_iso_for_usb(&local_iso, &iso, &weak)?;
     status(weak.clone(), "Comprobando la unidad USB…");
     let current = disks()?
         .into_iter()
@@ -614,7 +606,7 @@ pub(super) fn prepare(
     }
     let temporary = usb_copy_temp_path(&root)?;
     status(weak.clone(), "Copiando la ISO al USB…");
-    if let Err(error) = copy_with_progress(&local_iso, &temporary, iso.size, weak.clone()) {
+    if let Err(error) = copy_with_progress(&local_iso, &temporary, &iso, weak.clone()) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
