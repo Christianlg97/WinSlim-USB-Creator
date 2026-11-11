@@ -12,6 +12,7 @@ mod platform;
 #[path = "platform/linux.rs"]
 mod platform;
 use platform::*;
+mod segmented;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -61,10 +62,8 @@ const DOWNLOAD_RUNNING: u8 = 1;
 const DOWNLOAD_CANCELLED: u8 = 2;
 const DOWNLOAD_COMMITTING: u8 = 3;
 const DOWNLOAD_CANCELLED_MESSAGE: &str = "Descarga cancelada";
-const PARALLEL_CONNECTIONS: usize = 4;
-const DOWNLOAD_SEGMENT_BYTES: u64 = 32 * 1024 * 1024;
+/// A partir de este tamaño la ISO se descarga por tramos y desde varias fuentes.
 const PARALLEL_MIN_BYTES: u64 = 64 * 1024 * 1024;
-const MIRROR_PROBE_BYTES: u64 = 512 * 1024;
 const MAX_MIRROR_PROBES: usize = 8;
 const AVAILABILITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const AVAILABILITY_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -745,329 +744,6 @@ fn retry_iso_download(
     Ok(())
 }
 
-// AB Download Manager reparte los ficheros que admiten rangos entre varias
-// conexiones. Aquí usamos lotes acotados para conservar el archivo .part como
-// prefijo continuo y poder volver al descargador de una conexión sin perderlo.
-fn download_range(
-    url: &str,
-    path: &Path,
-    from: u64,
-    to: u64,
-    total: u64,
-    progress: &AtomicU64,
-    abort: &AtomicBool,
-    download_state: &AtomicU8,
-) -> Result<(), String> {
-    let mut completed = 0;
-    let mut last_error = String::new();
-    for attempt in 0..3 {
-        if abort.load(Ordering::Acquire) {
-            return Err("Descarga por fragmentos detenida".into());
-        }
-        check_download_cancellation(download_state)?;
-        let resume_from = from + completed;
-        let expected_range = format!("bytes {resume_from}-{to}/{total}");
-        let expected_length = to - resume_from + 1;
-        let agent = ureq::builder()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(15))
-            .build();
-        let response = agent
-            .get(url)
-            .set("User-Agent", "WinSlimUsbCreator/0.1")
-            .set("Accept-Encoding", "identity")
-            .set("Range", &format!("bytes={resume_from}-{to}"))
-            .call();
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = http_error("descargar fragmento", error);
-                if attempt < 2 {
-                    thread::sleep(Duration::from_secs(1));
-                }
-                continue;
-            }
-        };
-        if response.status() != 206
-            || response.header("Content-Range") != Some(expected_range.as_str())
-            || response
-                .header("Content-Length")
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length != expected_length)
-            || response
-                .header("Content-Type")
-                .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
-            || response
-                .header("Content-Encoding")
-                .is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
-        {
-            return Err("El espejo no respetó el rango solicitado".into());
-        }
-        let mut reader = response.into_reader();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(path)
-            .map_err(|error| file_error("crear fragmento temporal", path, error))?;
-        file.set_len(completed)
-            .map_err(|error| file_error("ajustar fragmento temporal", path, error))?;
-        file.seek(SeekFrom::Start(completed))
-            .map_err(|error| file_error("reanudar fragmento temporal", path, error))?;
-        let mut remaining = expected_length;
-        let mut buffer = [0u8; 256 * 1024];
-        let result = (|| -> Result<(), String> {
-            while remaining > 0 {
-                if abort.load(Ordering::Acquire) {
-                    return Err("Descarga por fragmentos detenida".into());
-                }
-                check_download_cancellation(download_state)?;
-                let limit = remaining.min(buffer.len() as u64) as usize;
-                let length = reader
-                    .read(&mut buffer[..limit])
-                    .map_err(|error| format!("Lectura del fragmento: {error}"))?;
-                if length == 0 {
-                    return Err("El espejo cerró un fragmento antes de completarlo".into());
-                }
-                file.write_all(&buffer[..length])
-                    .map_err(|error| file_error("guardar fragmento", path, error))?;
-                remaining -= length as u64;
-                completed += length as u64;
-                progress.store(completed, Ordering::Release);
-            }
-            file.sync_all()
-                .map_err(|error| file_error("guardar fragmento", path, error))?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) if error == DOWNLOAD_CANCELLED_MESSAGE => return Err(error),
-            Err(error) => last_error = error,
-        }
-        if attempt < 2 {
-            thread::sleep(Duration::from_secs(1));
-        }
-    }
-    Err(last_error)
-}
-
-fn download_iso_parallel(
-    iso: &Iso,
-    preferred_url: Option<&str>,
-    weak: slint::Weak<MainWindow>,
-    dir: &Path,
-    part: &Path,
-    downloaded: &mut u64,
-    hash: &mut md5::Context,
-    download_state: &AtomicU8,
-    initial_bytes: u64,
-    start: Instant,
-    last_update: &mut Instant,
-) -> Result<(), String> {
-    let temp_dir = dir.join(format!("{}.part-segments", iso.name));
-    if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir)
-            .map_err(|error| file_error("limpiar fragmentos anteriores", &temp_dir, error))?;
-    }
-    if iso.md5.is_none() {
-        log_event("INFO etapa=descarga_paralela md5_no_disponible usar_una_conexion".into());
-        return Ok(());
-    }
-    if iso.size.saturating_sub(*downloaded) < PARALLEL_MIN_BYTES {
-        return Ok(());
-    }
-    let url = if let Some(url) = preferred_url {
-        url.to_owned()
-    } else {
-        match resolve_download(iso) {
-            Ok(url) => url,
-            Err(error) => {
-                log_event(format!("WARNING etapa=descarga_paralela motivo={error}"));
-                return Ok(());
-            }
-        }
-    };
-    check_download_cancellation(download_state)?;
-    // Una petición mínima comprueba el soporte real de Range. No basta con
-    // Accept-Ranges: algunos espejos lo anuncian pero devuelven el archivo entero.
-    let probe = ureq::builder()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(15))
-        .build()
-        .get(&url)
-        .set("User-Agent", "WinSlimUsbCreator/0.1")
-        .set("Accept-Encoding", "identity")
-        .set("Range", "bytes=0-0")
-        .call();
-    let supports_ranges = probe.is_ok_and(|response| {
-        response.status() == 206
-            && response.header("Content-Range") == Some(format!("bytes 0-0/{}", iso.size).as_str())
-            && response.header("Content-Length") == Some("1")
-    });
-    if !supports_ranges {
-        log_event("INFO etapa=descarga_paralela rangos_no_disponibles usar_una_conexion".into());
-        return Ok(());
-    }
-    fs::create_dir(&temp_dir)
-        .map_err(|error| file_error("crear carpeta de fragmentos", &temp_dir, error))?;
-    log_event(format!(
-        "INFO etapa=descarga_paralela conexiones={} fragmento_bytes={DOWNLOAD_SEGMENT_BYTES}",
-        PARALLEL_CONNECTIONS
-    ));
-    let result = (|| -> Result<(), String> {
-        while *downloaded < iso.size {
-            check_download_cancellation(download_state)?;
-            let batch_bytes = iso
-                .size
-                .saturating_sub(*downloaded)
-                .min(DOWNLOAD_SEGMENT_BYTES * PARALLEL_CONNECTIONS as u64);
-            if fs_free_bytes(dir)? < iso.size.saturating_sub(*downloaded) + batch_bytes {
-                log_event(
-                    "INFO etapa=descarga_paralela espacio_temporal_insuficiente usar_una_conexion"
-                        .into(),
-                );
-                break;
-            }
-            let batch_end = *downloaded + batch_bytes;
-            let mut ranges = Vec::new();
-            let mut from = *downloaded;
-            while from < batch_end {
-                let to = (from + DOWNLOAD_SEGMENT_BYTES).min(batch_end) - 1;
-                ranges.push((from, to));
-                from = to + 1;
-            }
-            let abort = AtomicBool::new(false);
-            let progress = (0..ranges.len())
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>();
-            let failure = thread::scope(|scope| {
-                let (sender, receiver) = mpsc::channel();
-                for (index, &(from, to)) in ranges.iter().enumerate() {
-                    let sender = sender.clone();
-                    let slot = &progress[index];
-                    let abort = &abort;
-                    let path = temp_dir.join(format!("{index}.segment"));
-                    let url = &url;
-                    scope.spawn(move || {
-                        let result = download_range(
-                            url,
-                            &path,
-                            from,
-                            to,
-                            iso.size,
-                            slot,
-                            abort,
-                            download_state,
-                        );
-                        let _ = sender.send(result);
-                    });
-                }
-                drop(sender);
-                let mut received = 0;
-                let mut failure = None;
-                while received < ranges.len() {
-                    if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED {
-                        abort.store(true, Ordering::Release);
-                    }
-                    match receiver.recv_timeout(Duration::from_millis(250)) {
-                        Ok(Ok(())) => received += 1,
-                        Ok(Err(error)) => {
-                            received += 1;
-                            abort.store(true, Ordering::Release);
-                            if failure.is_none() {
-                                failure = Some(error);
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            failure =
-                                Some("Un fragmento terminó sin informar del resultado".into());
-                            break;
-                        }
-                    }
-                    if last_update.elapsed() >= Duration::from_millis(250) {
-                        let in_flight = progress
-                            .iter()
-                            .map(|slot| slot.load(Ordering::Acquire))
-                            .sum::<u64>();
-                        let received_bytes = (*downloaded + in_flight).min(iso.size);
-                        let speed = received_bytes.saturating_sub(initial_bytes) as f64
-                            / start.elapsed().as_secs_f64().max(0.1);
-                        let remaining = (iso.size.saturating_sub(received_bytes) as f64
-                            / speed.max(1.0)) as u64;
-                        let message = format!(
-                            "Descargando · {} / {} · {}/s · {} restantes",
-                            human(received_bytes),
-                            human(iso.size),
-                            human(speed as u64),
-                            format_duration(remaining)
-                        );
-                        let fraction =
-                            (received_bytes as f64 / iso.size as f64).clamp(0.0, 1.0) as f32;
-                        ui(weak.clone(), move |window| {
-                            window.set_status_text(message.into());
-                            window.set_progress(fraction);
-                        });
-                        *last_update = Instant::now();
-                    }
-                }
-                failure
-            });
-            check_download_cancellation(download_state)?;
-            if let Some(error) = failure {
-                log_event(format!(
-                    "WARNING etapa=descarga_paralela motivo={error} reanudar_desde={}",
-                    *downloaded
-                ));
-                break;
-            }
-            let mut output = if *downloaded == 0 {
-                File::create(part)
-                    .map_err(|error| file_error("crear descarga temporal", part, error))?
-            } else {
-                OpenOptions::new()
-                    .append(true)
-                    .open(part)
-                    .map_err(|error| file_error("reanudar descarga temporal", part, error))?
-            };
-            let mut buffer = vec![0u8; 1024 * 1024];
-            for (index, &(from, to)) in ranges.iter().enumerate() {
-                let path = temp_dir.join(format!("{index}.segment"));
-                let mut input = File::open(&path)
-                    .map_err(|error| file_error("abrir fragmento temporal", &path, error))?;
-                if input.metadata().map_err(|error| error.to_string())?.len() != to - from + 1 {
-                    return Err("Un fragmento no tiene el tamaño esperado".into());
-                }
-                loop {
-                    check_download_cancellation(download_state)?;
-                    let length = input
-                        .read(&mut buffer)
-                        .map_err(|error| file_error("leer fragmento", &path, error))?;
-                    if length == 0 {
-                        break;
-                    }
-                    output
-                        .write_all(&buffer[..length])
-                        .map_err(|error| file_error("unir fragmentos", part, error))?;
-                    hash.consume(&buffer[..length]);
-                    *downloaded += length as u64;
-                }
-                drop(input);
-                fs::remove_file(&path)
-                    .map_err(|error| file_error("eliminar fragmento unido", &path, error))?;
-            }
-            output
-                .sync_all()
-                .map_err(|error| file_error("guardar descarga", part, error))?;
-        }
-        Ok(())
-    })();
-    let cleanup = fs::remove_dir_all(&temp_dir)
-        .map_err(|error| file_error("eliminar fragmentos temporales", &temp_dir, error));
-    result?;
-    cleanup?;
-    Ok(())
-}
-
 fn download_iso(
     iso: &Iso,
     weak: slint::Weak<MainWindow>,
@@ -1104,9 +780,16 @@ fn download_iso_to(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(file_error("eliminar descarga cancelada", &part, error)),
         }
+        // Carpeta de fragmentos de versiones anteriores del descargador.
         if segments.exists() {
             fs::remove_dir_all(&segments)
                 .map_err(|error| file_error("eliminar fragmentos cancelados", &segments, error))?;
+        }
+        let progress = segmented::state_path(&part);
+        match fs::remove_file(&progress) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(file_error("eliminar progreso cancelado", &progress, error)),
         }
         return Err(DOWNLOAD_CANCELLED_MESSAGE.into());
     }
@@ -1145,6 +828,39 @@ fn download_iso_to_inner(
         return Ok(final_path);
     }
     let part = dir.join(format!("{}.part", iso.name));
+    // Las ISO grandes con MD5 publicado se descargan por tramos desde todas las
+    // fuentes disponibles; la descarga de una conexión queda como respaldo.
+    if iso.md5.is_some() && iso.size >= PARALLEL_MIN_BYTES {
+        status(weak.clone(), "Buscando servidores de descarga…");
+        let sources = segmented::discover_sources(iso);
+        check_download_cancellation(download_state)?;
+        if sources.is_empty() {
+            log_event("INFO etapa=descargar_iso sin_fuentes_con_rangos usar_una_conexion".into());
+        } else {
+            segmented::download_segmented(
+                iso,
+                &sources,
+                &part,
+                &weak,
+                download_state,
+                segmented::SegmentConfig::default(),
+            )?;
+            commit_download(download_state)?;
+            if final_path.exists() {
+                fs::remove_file(&final_path)
+                    .map_err(|e| file_error("reemplazar ISO antigua", &final_path, e))?;
+            }
+            fs::rename(&part, &final_path)
+                .map_err(|e| file_error("finalizar descarga", &final_path, e))?;
+            log_event(format!(
+                "INFO etapa=descargar_iso completada ruta={}",
+                final_path.display()
+            ));
+            return Ok(final_path);
+        }
+    }
+    // La descarga de una conexión espera un `.part` continuo desde el principio.
+    segmented::convert_to_contiguous(&part)?;
     let mut downloaded = fs::metadata(&part)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -1204,29 +920,10 @@ fn download_iso_to_inner(
     let mut last_update = Instant::now() - Duration::from_secs(2);
     let mut last_log = Instant::now();
     let mut attempts = 0;
-    let mut preferred_url = choose_download_mirror(iso, weak.clone(), download_state);
-    check_download_cancellation(download_state)?;
-    download_iso_parallel(
-        iso,
-        preferred_url.as_deref(),
-        weak.clone(),
-        dir,
-        &part,
-        &mut downloaded,
-        &mut hash,
-        download_state,
-        initial_bytes,
-        start,
-        &mut last_update,
-    )?;
     while downloaded < iso.size {
         check_download_cancellation(download_state)?;
         status(weak.clone(), "Conectando con SourceForge…");
-        let selected_url = match preferred_url.take() {
-            Some(url) => Ok(url),
-            None => resolve_download(iso),
-        };
-        let direct_url = match selected_url {
+        let direct_url = match resolve_download(iso) {
             Ok(url) => url,
             Err(error) => {
                 retry_iso_download(
@@ -1496,127 +1193,6 @@ fn available_mirrors(iso: &Iso) -> Result<Vec<String>, String> {
         .read_to_string(&mut html)
         .map_err(|error| format!("No se pudo leer la lista de espejos: {error}"))?;
     Ok(parse_mirror_choices(&html))
-}
-
-fn probe_mirror(
-    iso: &Iso,
-    mirror: &str,
-    download_state: &AtomicU8,
-) -> Option<(String, String, Duration)> {
-    if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED {
-        return None;
-    }
-    let sample = MIRROR_PROBE_BYTES.min(iso.size);
-    let range = format!("bytes=0-{}", sample - 1);
-    let url = format!("{}?use_mirror={mirror}", iso.url);
-    let start = Instant::now();
-    let response = ureq::builder()
-        .timeout_connect(Duration::from_secs(3))
-        .timeout_read(Duration::from_secs(4))
-        .build()
-        .get(&url)
-        .set("User-Agent", "WinSlimUsbCreator/0.1")
-        .set("Accept-Encoding", "identity")
-        .set("Range", &range)
-        .call()
-        .ok()?;
-    if response.status() != 206
-        || response.header("Content-Range")
-            != Some(format!("bytes 0-{}/{size}", sample - 1, size = iso.size).as_str())
-        || response
-            .header("Content-Type")
-            .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
-    {
-        return None;
-    }
-    let direct_url = response.get_url().to_owned();
-    let actual_host = direct_url.strip_prefix("https://")?.split('/').next()?;
-    let expected_host = format!("{mirror}.dl.sourceforge.net");
-    if actual_host != expected_host.as_str() {
-        return None;
-    }
-    if !direct_url.contains(&format!("/project/winslim11-isos/{}", iso.name)) {
-        return None;
-    }
-    let mut reader = response.into_reader();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut received = 0;
-    while received < sample {
-        if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED
-            || start.elapsed() > Duration::from_secs(5)
-        {
-            return None;
-        }
-        let limit = (sample - received).min(buffer.len() as u64) as usize;
-        let length = reader.read(&mut buffer[..limit]).ok()?;
-        if length == 0 {
-            return None;
-        }
-        received += length as u64;
-    }
-    Some((mirror.to_owned(), direct_url, start.elapsed()))
-}
-
-fn choose_download_mirror(
-    iso: &Iso,
-    weak: slint::Weak<MainWindow>,
-    download_state: &AtomicU8,
-) -> Option<String> {
-    status(weak.clone(), "Consultando los espejos de SourceForge…");
-    let mut mirrors = match available_mirrors(iso) {
-        Ok(mirrors) => mirrors,
-        Err(error) => {
-            log_event(format!(
-                "WARNING etapa=elegir_espejo motivo={error} usando_automatico"
-            ));
-            return None;
-        }
-    };
-    if mirrors.len() <= 1 {
-        log_event(format!(
-            "INFO etapa=elegir_espejo disponibles={} unico={}",
-            mirrors.len(),
-            mirrors.first().map(String::as_str).unwrap_or("ninguno")
-        ));
-        status(weak, "Iniciando descarga de la ISO…");
-        return None;
-    }
-    mirrors.sort_by_key(|mirror| mirror.as_str() == "master");
-    mirrors.truncate(MAX_MIRROR_PROBES);
-    status(weak.clone(), "Comparando la velocidad de los espejos…");
-    let results = thread::scope(|scope| {
-        let probes = mirrors
-            .iter()
-            .map(|mirror| scope.spawn(move || probe_mirror(iso, mirror, download_state)))
-            .collect::<Vec<_>>();
-        probes
-            .into_iter()
-            .filter_map(|probe| probe.join().ok().flatten())
-            .collect::<Vec<_>>()
-    });
-    if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED {
-        return None;
-    }
-    for (mirror, url, elapsed) in &results {
-        log_event(format!(
-            "INFO etapa=medir_espejo solicitado={mirror} servidor={} bytes={} segundos={:.2}",
-            url.split('?').next().unwrap_or(""),
-            MIRROR_PROBE_BYTES,
-            elapsed.as_secs_f64()
-        ));
-    }
-    let selected = results.into_iter().min_by_key(|(_, _, elapsed)| *elapsed);
-    if let Some((mirror, url, _)) = selected {
-        log_event(format!("INFO etapa=elegir_espejo seleccionado={mirror}"));
-        status(
-            weak,
-            format!("Espejo seleccionado: {mirror}. Iniciando descarga…"),
-        );
-        Some(url)
-    } else {
-        log_event("WARNING etapa=elegir_espejo sin_candidatos_validos usando_automatico".into());
-        None
-    }
 }
 
 fn resolve_download(iso: &Iso) -> Result<String, String> {
@@ -2761,7 +2337,9 @@ fn main() -> Result<(), slint::PlatformError> {
             if !begin(&state, &window) {
                 return;
             }
-            window.set_status_text("Consultando el enlace alternativo en GitHub…".into());
+            // La indicación se muestra ya al pulsar: el navegador se abre encima de
+            // la ventana y taparía un mensaje que solo apareciera después.
+            window.set_status_text("Abriendo la descarga en el navegador. Cuando termine, pulsa «Cargar ISO local» y elige la ISO descargada.".into());
             let weak = weak.clone();
             let state = state.clone();
             thread::spawn(move || {
@@ -2778,7 +2356,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         "INFO etapa=descarga_alternativa dominio={}",
                         link.host_str().unwrap_or("")
                     ));
-                    Ok("Enlace de descarga alternativo abierto en el navegador".into())
+                    Ok("La descarga se abrió en el navegador. Cuando termine, pulsa «Cargar ISO local» y elige la ISO descargada.".into())
                 });
                 finish(weak, result, state);
             });
@@ -2793,11 +2371,19 @@ fn main() -> Result<(), slint::PlatformError> {
             if lock_state(&state).busy {
                 return;
             }
-            let Some(path) = rfd::FileDialog::new()
+            let mut dialog = rfd::FileDialog::new()
                 .set_title("Seleccionar una imagen ISO")
-                .add_filter("Imagen ISO", &["iso"])
-                .pick_file()
-            else {
+                .add_filter("Imagen ISO", &["iso"]);
+            // Empieza en Descargas, donde el navegador guarda la descarga alternativa
+            // (la descarga de la aplicación está en su subcarpeta WinSlim).
+            if let Some(downloads) = downloads_dir()
+                .ok()
+                .and_then(|dir| dir.parent().map(Path::to_path_buf))
+                .filter(|dir| dir.is_dir())
+            {
+                dialog = dialog.set_directory(downloads);
+            }
+            let Some(path) = dialog.pick_file() else {
                 return;
             };
             if !path
@@ -3206,74 +2792,6 @@ mod tests {
         };
         assert!(check_download_available(&iso).is_err());
         server.join().unwrap();
-    }
-
-    #[test]
-    fn ranged_download_resumes_a_fragment_and_rejects_ignored_ranges() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            for request_number in 0..3 {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0u8; 1024];
-                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                    let length = stream.read(&mut buffer).unwrap();
-                    assert!(length > 0);
-                    request.extend_from_slice(&buffer[..length]);
-                }
-                let request = String::from_utf8(request).unwrap();
-                if request_number == 0 {
-                    assert!(request.contains("Range: bytes=16-127"));
-                    write!(
-                        stream,
-                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 16-127/256\r\nContent-Length: 112\r\nConnection: close\r\n\r\n"
-                    )
-                    .unwrap();
-                    stream.write_all(&(16u8..64).collect::<Vec<_>>()).unwrap();
-                } else if request_number == 1 {
-                    assert!(request.contains("Range: bytes=64-127"));
-                    write!(
-                        stream,
-                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 64-127/256\r\nContent-Length: 64\r\nConnection: close\r\n\r\n"
-                    )
-                    .unwrap();
-                    stream.write_all(&(64u8..128).collect::<Vec<_>>()).unwrap();
-                } else {
-                    assert!(request.contains("Range: bytes=16-127"));
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Length: 256\r\nConnection: close\r\n\r\n"
-                    )
-                    .unwrap();
-                }
-            }
-        });
-        let dir = std::env::temp_dir().join(format!(
-            "winslim-range-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&dir).unwrap();
-        let url = format!("http://{address}/test.iso");
-        let progress = AtomicU64::new(0);
-        let abort = AtomicBool::new(false);
-        let state = AtomicU8::new(DOWNLOAD_RUNNING);
-        let good = dir.join("good.segment");
-        download_range(&url, &good, 16, 127, 256, &progress, &abort, &state).unwrap();
-        assert_eq!(fs::read(good).unwrap(), (16u8..128).collect::<Vec<_>>());
-        assert_eq!(progress.load(Ordering::Acquire), 112);
-        let bad = dir.join("bad.segment");
-        assert!(download_range(&url, &bad, 16, 127, 256, &progress, &abort, &state).is_err());
-        assert!(!bad.exists());
-        server.join().unwrap();
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3911,6 +3429,43 @@ mod tests {
             .header("Content-Range")
             .unwrap()
             .starts_with("bytes 1024-2047/"));
+    }
+
+    #[test]
+    #[ignore = "requires network access to the alternative download"]
+    fn alternative_availability_is_reported() {
+        println!("{:?}", fetch_available_alternative_link());
+    }
+
+    /// Descarga real integrada (fuentes + tramos) que se cancela a los 25 s:
+    /// no deben quedar ni el `.part` ni su tabla de tramos.
+    #[test]
+    #[ignore = "downloads from the real servers"]
+    fn real_download_cancels_cleanly() {
+        let iso = fetch_latest().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "winslim-real-cancel-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = Arc::new(AtomicU8::new(DOWNLOAD_RUNNING));
+        let canceller = {
+            let state = state.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(25));
+                state.store(DOWNLOAD_CANCELLED, Ordering::Release);
+            })
+        };
+        let result = download_iso_to(&iso, slint::Weak::default(), &dir, &state);
+        canceller.join().unwrap();
+        assert_eq!(result.unwrap_err(), DOWNLOAD_CANCELLED_MESSAGE);
+        let part = dir.join(format!("{}.part", iso.name));
+        assert!(!part.exists());
+        assert!(!segmented::state_path(&part).exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

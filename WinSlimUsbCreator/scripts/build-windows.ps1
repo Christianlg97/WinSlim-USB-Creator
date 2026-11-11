@@ -39,15 +39,14 @@ try {
     Write-Step 'Comprobando Rust'
     $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
     $rustup = Join-Path $cargoBin 'rustup.exe'
-    $cargo = Join-Path $cargoBin 'cargo.exe'
-    if (-not (Test-Path $rustup) -or -not (Test-Path $cargo)) {
+    if (-not (Test-Path $rustup)) {
         Write-Host 'Rust no esta instalado. Descargando rustup oficial...' -ForegroundColor Yellow
         $installer = Join-Path $env:TEMP 'winslim-rustup-init.exe'
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' -OutFile $installer -UseBasicParsing
         & $installer -y --default-host x86_64-pc-windows-msvc --default-toolchain stable --profile minimal --no-modify-path
         if ($LASTEXITCODE -ne 0) { Fail "La instalacion de Rust fallo. Codigo: $LASTEXITCODE" }
-        if (-not (Test-Path $rustup) -or -not (Test-Path $cargo)) { Fail 'Rust se instalo, pero cargo o rustup no aparecieron en el perfil.' }
+        if (-not (Test-Path $rustup)) { Fail 'Rust se instalo, pero rustup no aparecio en el perfil.' }
     }
     $installed = @(& $rustup toolchain list)
     if (-not ($installed | Where-Object { $_.StartsWith('stable-x86_64-pc-windows-msvc') })) {
@@ -61,7 +60,10 @@ try {
     Write-Step 'Compilando WinSlim USB Creator'
     Push-Location $project
     try {
-        & $cargo '+stable-x86_64-pc-windows-msvc' build --release --locked
+        # Se invoca cargo a traves de rustup.exe y no del proxy .cargo\bin\cargo.exe:
+        # en algunos equipos los proxies son enlaces simbolicos que Windows PowerShell
+        # no puede ejecutar ("No hay ninguna aplicacion asociada con el archivo").
+        & $rustup run stable-x86_64-pc-windows-msvc cargo build --release --locked
         if ($LASTEXITCODE -ne 0) { Fail "Cargo fallo. Codigo: $LASTEXITCODE" }
     } finally { Pop-Location }
     $result = Join-Path $project 'target\release\winslim-usb-creator.exe'
