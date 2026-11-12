@@ -249,6 +249,46 @@ component FormatSelect inherits Rectangle {
     }
 }
 
+// Botón cuadrado de la cabecera con icono (carpeta de descargas, registro) y ayuda
+// contextual tras 2500 ms de hover. El icono se coloca como hijo del componente.
+component HeaderButton inherits Rectangle {
+    in property <string> help-text;
+    callback clicked;
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+    background: header-touch.pressed ? #505050e6 : header-touch.has-hover ? #404040dd : #303030cc;
+    border-color: header-touch.has-hover ? #bdbdbd99 : #aaaaaa66;
+    border-width: 1px;
+    animate background, border-color { duration: 120ms; }
+    @children
+    header-touch := TouchArea {
+        changed has-hover => {
+            if (self.has-hover) { help-delay.start(); }
+            else { help-delay.stop(); help-popup.close(); }
+        }
+        clicked => { help-delay.stop(); help-popup.close(); root.clicked(); }
+    }
+    help-delay := Timer {
+        interval: 2500ms; running: false;
+        triggered() => { self.stop(); if (header-touch.has-hover) { help-popup.show(); } }
+    }
+    help-popup := PopupWindow {
+        x: root.width - self.width; y: root.height + 8px;
+        width: 280px; height: 80px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            border-radius: 11px; background: #252525;
+            border-color: #898989; border-width: 1px;
+            Text {
+                x: 12px; y: 8px; width: parent.width - 24px; height: parent.height - 16px;
+                text: root.help-text;
+                color: #f0f0f0; font-size: 14px; font-weight: 700; wrap: word-wrap; vertical-alignment: center;
+            }
+        }
+    }
+}
+
 component StepBadge inherits Rectangle {
     in property <string> number;
     in property <bool> current: false;
@@ -297,16 +337,22 @@ export component MainWindow inherits Window {
     in-out property <int> server-availability: 0;
     // -1: sin descarga alternativa; 0: comprobando; 1: enlace alternativo accesible.
     in-out property <int> alternative-availability: 0;
+    // Descarga o verificación de la ISO en curso: el paso 01 solo ofrece cancelarla.
+    private property <bool> operation-active: root.download-active || root.verifying;
     // Fila de disponibilidad del paso 01.
     private property <bool> local-iso-shown: root.iso-stage == 2 && !root.download-active;
+    // Con la ISO ya descargada la fila muestra su verificación, no el estado de los servidores.
+    private property <bool> downloaded-shown: root.iso-stage == 3 && !root.download-active;
     private property <bool> servers-pending: root.server-availability == 0 || root.alternative-availability == 0;
-    private property <bool> sources-shown: !root.local-iso-shown && !root.servers-pending;
+    private property <bool> sources-shown: !root.local-iso-shown && !root.downloaded-shown && !root.servers-pending;
     // 1 verde, -1 rojo, 0 gris para el primer indicador de la fila.
-    private property <int> main-tone: root.local-iso-shown ? 1 : root.servers-pending ? 0 : root.server-availability;
+    private property <int> main-tone: root.local-iso-shown ? 1
+        : root.downloaded-shown ? (root.iso-verified && !root.verifying ? 1 : 0)
+        : root.servers-pending ? 0 : root.server-availability;
     // El servidor principal no ofrece la ISO, pero la descarga alternativa sí.
     private property <bool> alternative-only: root.server-availability == -1 && root.alternative-availability == 1;
-    // Pasos sin ISO que descargar del servidor principal: se ofrece la alternativa junto a la búsqueda.
-    private property <bool> alternative-mode: root.alternative-only && !root.download-active && (root.iso-stage == 0 || root.iso-stage == 3);
+    // Sin ISO localizada ni descargada: se ofrece la alternativa junto a la búsqueda.
+    private property <bool> alternative-mode: root.alternative-only && !root.operation-active && root.iso-stage == 0;
     in-out property <string> local-file: "Sin descargar";
     in-out property <string> status-text: "Listo";
     // -2: comprobando; -1: no se pudo comprobar; 0: deshabilitado; 1: habilitado.
@@ -321,6 +367,11 @@ export component MainWindow inherits Window {
     private property <int> active-step: root.preparation-complete ? 4 : root.iso-stage < 2 ? 1 : root.selected-disk < 0 ? 2 : 3;
     in-out property <bool> download-active: false;
     in-out property <bool> download-cancelling: false;
+    // La ISO descargada (paso 03) superó la comprobación de MD5 y no ha cambiado desde entonces.
+    in-out property <bool> iso-verified: false;
+    // «Verificar integridad de la ISO» en curso y su cancelación.
+    in-out property <bool> verifying: false;
+    in-out property <bool> verification-cancelling: false;
     // Preparación del USB en curso (formateo, copia o verificación).
     in-out property <bool> preparing: false;
     in-out property <bool> close-confirm-visible: false;
@@ -346,7 +397,11 @@ export component MainWindow inherits Window {
     callback download-alternative-iso();
     callback download-latest-iso();
     callback cancel-download();
+    callback verify-iso();
+    callback cancel-verification();
     callback load-local-iso();
+    callback discard-local-iso();
+    callback open-downloads-folder();
     callback refresh-usb();
     callback select-disk(int);
     callback request-prepare(bool);
@@ -410,14 +465,27 @@ export component MainWindow inherits Window {
                     overflow: elide;
                 }
             }
-            log-button := Rectangle {
+            HeaderButton {
+                x: header.width - 104px; y: 13px;
+                help-text: "Abre la carpeta donde la aplicación guarda las ISO descargadas.";
+                clicked => { root.open-downloads-folder(); }
+                // Carpeta con una flecha de descarga: acceso a las ISO descargadas.
+                Path {
+                    x: 9px; y: 9px;
+                    width: 20px; height: 20px;
+                    viewbox-width: 20; viewbox-height: 20;
+                    commands: "M 1 4 Q 1 2.5 2.5 2.5 L 7 2.5 L 9 4.5 L 17.5 4.5 Q 19 4.5 19 6 L 19 16 Q 19 17.5 17.5 17.5 L 2.5 17.5 Q 1 17.5 1 16 Z M 10 7.5 L 10 14 M 7.25 11.25 L 10 14 L 12.75 11.25";
+                    fill: transparent;
+                    stroke: #f5f5f5;
+                    stroke-width: 2px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                }
+            }
+            HeaderButton {
                 x: header.width - 58px; y: 13px;
-                width: 38px; height: 38px;
-                border-radius: 11px;
-                background: log-touch.pressed ? #505050e6 : log-touch.has-hover ? #404040dd : #303030cc;
-                border-color: log-touch.has-hover ? #bdbdbd99 : #aaaaaa66;
-                border-width: 1px;
-                animate background, border-color { duration: 120ms; }
+                help-text: "Muestra la actividad de la aplicación y los detalles de posibles errores.";
+                clicked => { root.show-logs(); }
                 // Hoja con líneas: acceso al registro de actividad.
                 Rectangle {
                     x: 11px; y: 8px;
@@ -429,31 +497,6 @@ export component MainWindow inherits Window {
                     Rectangle { x: 3px; y: 5px; width: 8px; height: 2px; background: #f5f5f5; }
                     Rectangle { x: 3px; y: 10px; width: 8px; height: 2px; background: #f5f5f5; }
                     Rectangle { x: 3px; y: 15px; width: 6px; height: 2px; background: #f5f5f5; }
-                }
-                log-touch := TouchArea {
-                    changed has-hover => {
-                        if (self.has-hover) { log-help-delay.start(); }
-                        else { log-help-delay.stop(); log-help-popup.close(); }
-                    }
-                    clicked => { log-help-delay.stop(); log-help-popup.close(); root.show-logs(); }
-                }
-                log-help-delay := Timer {
-                    interval: 2500ms; running: false;
-                    triggered() => { self.stop(); if (log-touch.has-hover) { log-help-popup.show(); } }
-                }
-                log-help-popup := PopupWindow {
-                    x: log-button.width - self.width; y: log-button.height + 8px;
-                    width: 280px; height: 80px;
-                    close-policy: close-on-click-outside;
-                    Rectangle {
-                        border-radius: 11px; background: #252525;
-                        border-color: #898989; border-width: 1px;
-                        Text {
-                            x: 12px; y: 8px; width: parent.width - 24px; height: parent.height - 16px;
-                            text: "Muestra la actividad de la aplicación y los detalles de posibles errores.";
-                            color: #f0f0f0; font-size: 14px; font-weight: 700; wrap: word-wrap; vertical-alignment: center;
-                        }
-                    }
                 }
             }
         }
@@ -491,7 +534,7 @@ export component MainWindow inherits Window {
                 }
 
                 Rectangle {
-                    height: root.download-active ? 220px : root.alternative-mode ? (root.width >= 900px ? 235px : 295px) : root.iso-stage == 2 ? (root.width < 900px ? 270px : 260px) : root.iso-stage == 1 ? (root.width >= 1020px ? 235px : 278px) : root.iso-stage == 3 ? 235px : 220px;
+                    height: root.operation-active ? 220px : root.alternative-mode ? (root.width >= 900px ? 235px : 295px) : root.iso-stage == 2 ? (root.width < 900px ? 290px : 260px) : root.iso-stage == 1 ? (root.width >= 1020px ? 235px : 278px) : root.iso-stage == 3 ? (root.width >= 900px ? 235px : 290px) : 220px;
                     border-radius: 14px;
                     background: root.active-step == 1 ? #202020ee : root.active-step > 1 ? #191919e8 : #161616e6;
                     border-color: root.active-step == 1 ? #d8d8d8ae : root.active-step > 1 ? #99999970 : #77777755;
@@ -513,13 +556,17 @@ export component MainWindow inherits Window {
                         }
                         LiveText {
                             text: root.download-active
-                                ? "Buscando o descargando la ISO. Puedes cancelar el proceso en cualquier momento."
+                                ? "La descarga de la ISO está en curso. Puedes cancelarla en cualquier momento."
+                                : root.verifying
+                                ? "Verificando la integridad de la ISO descargada. Puedes cancelar la verificación en cualquier momento."
                                 : root.iso-stage == 1
                                 ? "La última ISO está localizada. Descárgala en la aplicación o abre la alternativa en el navegador."
                                 : root.iso-stage == 2
-                                ? "La ISO local está lista para el paso 02. Puedes cambiarla o descargar la última versión."
+                                ? "La ISO local está lista para el paso 02. Puedes descartarla, cambiarla o descargar la última versión."
+                                : root.iso-stage == 3 && root.iso-verified
+                                ? "La ISO descargada está verificada y lista para el paso 02. Puedes buscar otra versión o cargar una imagen local."
                                 : root.iso-stage == 3
-                                ? "La ISO descargada está lista para el paso 02. Puedes buscar otra versión o cargar una imagen local."
+                                ? "La ISO ya está descargada y lista para el paso 02. Puedes verificar su integridad antes de continuar."
                                 : root.alternative-mode
                                 ? "La ISO no está disponible en el servidor principal. Prueba con «Descarga alternativa de la ISO» o elige una imagen de tu equipo con «Cargar ISO local»."
                                 : "Selecciona «Buscar última ISO de WinSlim en línea» para consultar la versión más reciente, o «Cargar ISO local» para elegir una imagen de tu equipo.";
@@ -558,8 +605,9 @@ export component MainWindow inherits Window {
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                         }
-                        // Disponibilidad: ISO local, «Conectando…» mientras se comprueba o el estado
-                        // de cada fuente (verde disponible, rojo no disponible, gris comprobando).
+                        // Disponibilidad: ISO local, verificación de la ISO descargada, «Conectando…»
+                        // mientras se comprueba o el estado de cada fuente (verde disponible, rojo no
+                        // disponible, gris comprobando o pendiente).
                         HorizontalLayout {
                             height: 20px;
                             spacing: 8px;
@@ -572,6 +620,9 @@ export component MainWindow inherits Window {
                             }
                             LiveText {
                                 text: root.local-iso-shown ? "ISO local cargada"
+                                    : root.downloaded-shown && root.verifying ? "ISO descargada: verificando su integridad…"
+                                    : root.downloaded-shown && root.iso-verified ? "ISO descargada: integridad verificada"
+                                    : root.downloaded-shown ? "ISO descargada: integridad sin verificar"
                                     : root.servers-pending ? "Conectando con los servidores de descarga…"
                                     : root.server-availability == 1 ? "Servidor principal: disponible"
                                     : "Servidor principal: no disponible";
@@ -606,7 +657,7 @@ export component MainWindow inherits Window {
                             wrap: word-wrap;
                             vertical-stretch: 0;
                         }
-                        if root.download-active || (root.iso-stage != 1 && !root.alternative-mode) : HorizontalLayout {
+                        if root.operation-active : HorizontalLayout {
                             spacing: 10px;
                             if root.download-active : ActionButton {
                                 label: root.download-cancelling ? "Cancelando…" : "Cancelar descarga";
@@ -616,36 +667,131 @@ export component MainWindow inherits Window {
                                 enabled: !root.download-cancelling;
                                 clicked => { root.cancel-download(); }
                             }
-                            if !root.download-active && root.iso-stage != 2 : ActionButton {
+                            if root.verifying : ActionButton {
+                                label: root.verification-cancelling ? "Cancelando…" : "Cancelar verificación";
+                                help-text: "Detiene la verificación. La ISO descargada no se modifica.";
+                                width: 190px;
+                                destructive: true;
+                                enabled: !root.verification-cancelling;
+                                clicked => { root.cancel-verification(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                        }
+                        if !root.operation-active && root.iso-stage == 0 && !root.alternative-mode : HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton {
                                 label: "Buscar última ISO de WinSlim en línea";
                                 help-text: "Busca la versión más reciente de WinSlim disponible para descargar.";
                                 width: 280px;
-                                primary: root.iso-stage == 0;
-                                quiet: root.iso-stage == 3;
+                                primary: true;
                                 enabled: !root.busy;
                                 clicked => { root.lookup-iso(); }
                             }
-                            if !root.download-active && root.iso-stage == 2 && !root.alternative-only : ActionButton {
+                            ActionButton {
+                                label: "Cargar ISO local";
+                                help-text: "Abre el explorador para elegir una ISO guardada en el equipo.";
+                                width: 150px;
+                                enabled: !root.busy;
+                                clicked => { root.load-local-iso(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                        }
+                        // ISO local cargada: descartarla vuelve a la última ISO localizada en línea.
+                        if !root.operation-active && root.iso-stage == 2 : HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton {
+                                label: "Descartar ISO local";
+                                help-text: "Deja de usar esta ISO y vuelve a la última ISO de WinSlim disponible en línea. El archivo no se elimina del equipo.";
+                                min-width: 165px;
+                                horizontal-stretch: 1;
+                                primary: true;
+                                enabled: !root.busy;
+                                clicked => { root.discard-local-iso(); }
+                            }
+                            if !root.alternative-only : ActionButton {
                                 label: "Descargar última ISO";
                                 help-text: "Busca y descarga la última ISO. La imagen local seguirá disponible durante la descarga.";
-                                width: 185px;
-                                primary: true;
+                                min-width: 185px;
+                                horizontal-stretch: 1;
                                 enabled: !root.busy;
                                 clicked => { root.download-latest-iso(); }
                             }
-                            if !root.download-active && root.iso-stage == 2 && root.alternative-only : ActionButton {
+                            if root.alternative-only : ActionButton {
                                 label: "Descarga alternativa de la ISO";
                                 help-text: "La ISO no está disponible en el servidor principal. Abre en el navegador una opción alternativa para descargarla.";
-                                width: 240px;
-                                primary: true;
+                                min-width: 240px;
+                                horizontal-stretch: 1;
                                 enabled: !root.busy;
                                 clicked => { root.download-alternative-iso(); }
                             }
-                            if !root.download-active : ActionButton {
-                                label: root.iso-stage == 2 || root.iso-stage == 3 ? "Cambiar ISO local" : "Cargar ISO local";
-                                help-text: "Abre el explorador para elegir una ISO guardada en el equipo.";
-                                width: 150px;
-                                quiet: root.iso-stage >= 2;
+                            ActionButton {
+                                label: "Cambiar ISO local";
+                                help-text: "Abre el explorador para elegir otra ISO guardada en el equipo.";
+                                help-align-right: true;
+                                min-width: 150px;
+                                horizontal-stretch: 1;
+                                quiet: true;
+                                enabled: !root.busy;
+                                clicked => { root.load-local-iso(); }
+                            }
+                        }
+                        // ISO ya descargada: el siguiente paso es el 02, así que ningún botón destaca.
+                        if !root.operation-active && root.iso-stage == 3 && root.width >= 900px : HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton {
+                                label: "Verificar integridad de la ISO";
+                                help-text: "Comprueba que la ISO descargada está completa y coincide con la suma MD5 publicada. También se comprueba antes de copiarla al USB.";
+                                help-detailed: true;
+                                min-width: 235px;
+                                horizontal-stretch: 1;
+                                enabled: !root.busy;
+                                clicked => { root.verify-iso(); }
+                            }
+                            ActionButton {
+                                label: "Volver a buscar la última ISO";
+                                help-text: "Comprueba si hay una versión más reciente de la ISO.";
+                                min-width: 255px;
+                                horizontal-stretch: 1;
+                                quiet: true;
+                                enabled: !root.busy;
+                                clicked => { root.lookup-iso(); }
+                            }
+                            ActionButton {
+                                label: "Cargar ISO local";
+                                help-text: "Elige una ISO que ya esté guardada en el equipo.";
+                                help-align-right: true;
+                                min-width: 175px;
+                                horizontal-stretch: 1;
+                                quiet: true;
+                                enabled: !root.busy;
+                                clicked => { root.load-local-iso(); }
+                            }
+                        }
+                        if !root.operation-active && root.iso-stage == 3 && root.width < 900px : ActionButton {
+                            label: "Verificar integridad de la ISO";
+                            help-text: "Comprueba que la ISO descargada está completa y coincide con la suma MD5 publicada. También se comprueba antes de copiarla al USB.";
+                            help-detailed: true;
+                            enabled: !root.busy;
+                            clicked => { root.verify-iso(); }
+                        }
+                        if !root.operation-active && root.iso-stage == 3 && root.width < 900px : HorizontalLayout {
+                            spacing: 10px;
+                            ActionButton {
+                                label: "Volver a buscar la última ISO";
+                                help-text: "Comprueba si hay una versión más reciente de la ISO.";
+                                min-width: 255px;
+                                horizontal-stretch: 1;
+                                quiet: true;
+                                enabled: !root.busy;
+                                clicked => { root.lookup-iso(); }
+                            }
+                            ActionButton {
+                                label: "Cargar ISO local";
+                                help-text: "Elige una ISO que ya esté guardada en el equipo.";
+                                help-align-right: true;
+                                min-width: 175px;
+                                horizontal-stretch: 1;
+                                quiet: true;
                                 enabled: !root.busy;
                                 clicked => { root.load-local-iso(); }
                             }
@@ -657,7 +803,7 @@ export component MainWindow inherits Window {
                                 help-text: "La ISO no está disponible en el servidor principal. Abre en el navegador una opción alternativa para descargarla.";
                                 min-width: 240px;
                                 horizontal-stretch: 1;
-                                primary: root.iso-stage == 0;
+                                primary: true;
                                 enabled: !root.busy;
                                 clicked => { root.download-alternative-iso(); }
                             }
@@ -671,7 +817,7 @@ export component MainWindow inherits Window {
                                 clicked => { root.lookup-iso(); }
                             }
                             ActionButton {
-                                label: root.iso-stage == 3 ? "Cambiar ISO local" : "Cargar ISO local";
+                                label: "Cargar ISO local";
                                 help-text: "Elige una ISO que ya esté guardada en el equipo.";
                                 help-align-right: true;
                                 min-width: 175px;
@@ -684,7 +830,7 @@ export component MainWindow inherits Window {
                         if root.alternative-mode && root.width < 900px : ActionButton {
                             label: "Descarga alternativa de la ISO";
                             help-text: "La ISO no está disponible en el servidor principal. Abre en el navegador una opción alternativa para descargarla.";
-                            primary: root.iso-stage == 0;
+                            primary: true;
                             enabled: !root.busy;
                             clicked => { root.download-alternative-iso(); }
                         }
@@ -700,7 +846,7 @@ export component MainWindow inherits Window {
                                 clicked => { root.lookup-iso(); }
                             }
                             ActionButton {
-                                label: root.iso-stage == 3 ? "Cambiar ISO local" : "Cargar ISO local";
+                                label: "Cargar ISO local";
                                 help-text: "Elige una ISO que ya esté guardada en el equipo.";
                                 help-align-right: true;
                                 min-width: 175px;

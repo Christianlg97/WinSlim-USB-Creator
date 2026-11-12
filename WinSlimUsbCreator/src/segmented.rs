@@ -913,7 +913,7 @@ pub(super) fn download_segmented(
                     .find(|error| !error.is_empty())
                     .unwrap_or_default();
                 break Err(format!(
-                    "Descarga interrumpida tras {}. Se guardó el progreso; pulsa Descargar para reanudar. Último error: {last_error}",
+                    "Descarga interrumpida tras {}. Se ha guardado el progreso; vuelve a iniciar la descarga para reanudarla. Último error: {last_error}",
                     human(engine.plan().done.total())
                 ));
             }
@@ -1012,7 +1012,7 @@ pub(super) fn download_segmented(
         let _ = fs::remove_file(part);
         let _ = fs::remove_file(state_path(part));
         return Err(
-            "La suma MD5 no coincide con la publicada por SourceForge. Se descartó la descarga; pulsa Descargar para repetirla."
+            "La suma MD5 no coincide con la publicada por SourceForge. Se ha descartado la descarga; vuelve a iniciarla para repetirla."
                 .into(),
         );
     }
