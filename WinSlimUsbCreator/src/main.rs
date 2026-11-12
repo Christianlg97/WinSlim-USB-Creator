@@ -67,6 +67,13 @@ const PARALLEL_MIN_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MIRROR_PROBES: usize = 8;
 const AVAILABILITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const AVAILABILITY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Intentos de la comprobación de disponibilidad antes de dar la ISO por no disponible.
+const AVAILABILITY_ATTEMPTS: u32 = 3;
+const AVAILABILITY_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Periodo del temporizador de disponibilidad. Con el servidor disponible solo se
+/// comprueba una de cada `SERVER_RECHECK_OK_TICKS` veces (cada diez minutos).
+const SERVER_RECHECK_INTERVAL: Duration = Duration::from_secs(120);
+const SERVER_RECHECK_OK_TICKS: u32 = 5;
 
 fn check_download_cancellation(download_state: &AtomicU8) -> Result<(), String> {
     if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED {
@@ -557,6 +564,60 @@ fn report_main_server_failure(weak: slint::Weak<MainWindow>) -> bool {
         window.set_alternative_availability(alternative);
     });
     alternative == 1
+}
+
+/// Muestra en el paso 01 la ISO encontrada en el RSS junto con su disponibilidad.
+/// Conserva la ISO ya descargada si es la misma versión y sigue en disco.
+fn show_found_iso(
+    weak: &slint::Weak<MainWindow>,
+    state: &Arc<Mutex<State>>,
+    iso: &Iso,
+    server: i32,
+    alternative: i32,
+) {
+    let mut current = lock_state(state);
+    let retained = if current.iso.as_ref().is_some_and(|previous| {
+        previous.url == iso.url
+            && previous.name == iso.name
+            && previous.size == iso.size
+            && previous.md5 == iso.md5
+    }) {
+        current
+            .local_iso
+            .as_ref()
+            .filter(|path| {
+                fs::metadata(path)
+                    .is_ok_and(|metadata| metadata.is_file() && metadata.len() == iso.size)
+            })
+            .cloned()
+    } else {
+        None
+    };
+    current.iso = Some(iso.clone());
+    current.local_iso = retained.clone();
+    if retained.is_none() {
+        current.selected = None;
+    }
+    drop(current);
+    let name = iso.name.clone();
+    let size = human(iso.size);
+    let local_file = retained
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Sin descargar".into());
+    // Todo en una sola actualización para que el paso 01 no cambie de diseño dos veces.
+    ui(weak.clone(), move |w| {
+        w.set_iso_name(name.into());
+        w.set_iso_size(size.into());
+        w.set_iso_stage(if retained.is_some() { 3 } else { 1 });
+        w.set_local_file(local_file.into());
+        w.set_server_availability(server);
+        w.set_alternative_availability(alternative);
+        if retained.is_none() {
+            w.set_selected_disk(-1);
+            w.set_reuse_ventoy(false);
+        }
+    });
 }
 
 fn parse_latest(xml: &str) -> Result<Iso, String> {
@@ -1303,9 +1364,41 @@ fn check_download_available(iso: &Iso) -> Result<(), String> {
     Ok(())
 }
 
-fn check_latest_download_available() -> Result<(), String> {
-    let iso = fetch_latest()?;
-    check_download_available(&iso)
+/// Repite `check_download_available` antes de rendirse: SourceForge publica una
+/// ISO recién subida en el RSS antes de servirla (su /download responde 404 un
+/// rato) y a veces tarda en contestar, así que un único fallo no es concluyente.
+fn confirm_download_available(iso: &Iso) -> Result<(), String> {
+    let mut attempt = 1;
+    loop {
+        match check_download_available(iso) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < AVAILABILITY_ATTEMPTS => {
+                log_event(format!(
+                    "WARNING etapa=comprobar_servidor intento={attempt} detalle={error}"
+                ));
+                attempt += 1;
+                thread::sleep(AVAILABILITY_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Registra el resultado de la comprobación del servidor principal y, si falló,
+/// comprueba la alternativa. Devuelve `(server-availability, alternative-availability)`.
+fn availability_of(check: &Result<(), String>) -> (i32, i32) {
+    match check {
+        Ok(()) => {
+            log_event("INFO etapa=comprobar_servidor iso_disponible=true".into());
+            (1, 0)
+        }
+        Err(error) => {
+            log_event(format!(
+                "WARNING etapa=comprobar_servidor iso_disponible=false detalle={error}"
+            ));
+            (-1, alternative_availability())
+        }
+    }
 }
 
 fn start_server_check(weak: slint::Weak<MainWindow>, running: Arc<AtomicBool>) {
@@ -1321,23 +1414,12 @@ fn start_server_check(weak: slint::Weak<MainWindow>, running: Arc<AtomicBool>) {
             }
         }
         let _release = Release(running);
-        let result = check_latest_download_available();
-        let available = result.is_ok();
-        match result {
-            Ok(()) => log_event("INFO etapa=comprobar_servidor iso_disponible=true".into()),
-            Err(error) => log_event(format!(
-                "WARNING etapa=comprobar_servidor iso_disponible=false detalle={error}"
-            )),
-        }
+        let check = fetch_latest().and_then(|iso| confirm_download_available(&iso));
         // Ambos estados se publican juntos para no mostrar «Descarga no disponible»
         // mientras todavía se comprueba la alternativa.
-        let alternative = if available {
-            0
-        } else {
-            alternative_availability()
-        };
+        let (server, alternative) = availability_of(&check);
         ui(weak, move |window| {
-            window.set_server_availability(if available { 1 } else { -1 });
+            window.set_server_availability(server);
             window.set_alternative_availability(alternative);
         });
     });
@@ -2054,11 +2136,19 @@ fn main() -> Result<(), slint::PlatformError> {
         let running = Arc::new(AtomicBool::new(false));
         start_server_check(weak.clone(), running.clone());
         // Cada comprobación consulta el RSS, el enlace de descarga y un espejo;
-        // diez minutos bastan para el indicador sin cargar a SourceForge.
-        server_timer.start(TimerMode::Repeated, Duration::from_secs(600), move || {
-            if weak.upgrade().is_some_and(|window| !window.get_busy()) {
-                start_server_check(weak.clone(), running.clone());
+        // con el servidor disponible bastan diez minutos sin cargar a SourceForge.
+        // Si falló (p. ej. una ISO recién subida que aún no sirve), se repite cada
+        // dos minutos para que el aviso desaparezca solo en cuanto se pueda descargar.
+        let mut ticks = 0u32;
+        server_timer.start(TimerMode::Repeated, SERVER_RECHECK_INTERVAL, move || {
+            ticks = ticks.wrapping_add(1);
+            let Some(window) = weak.upgrade() else { return };
+            if window.get_busy()
+                || (window.get_server_availability() == 1 && ticks % SERVER_RECHECK_OK_TICKS != 0)
+            {
+                return;
             }
+            start_server_check(weak.clone(), running.clone());
         });
     }
 
@@ -2155,51 +2245,22 @@ fn main() -> Result<(), slint::PlatformError> {
             let state = state.clone();
             thread::spawn(move || {
                 let _guard = PanicGuard::new(&weak, &state, None);
-                let result = fetch_latest();
-                if let Ok(iso) = &result {
-                    let mut current = lock_state(&state);
-                    let retained = if current.iso.as_ref().is_some_and(|previous| {
-                        previous.url == iso.url
-                            && previous.name == iso.name
-                            && previous.size == iso.size
-                            && previous.md5 == iso.md5
-                    }) {
-                        current
-                            .local_iso
-                            .as_ref()
-                            .filter(|path| {
-                                fs::metadata(path).is_ok_and(|metadata| {
-                                    metadata.is_file() && metadata.len() == iso.size
-                                })
-                            })
-                            .cloned()
-                    } else {
-                        None
-                    };
-                    current.iso = Some(iso.clone());
-                    current.local_iso = retained.clone();
-                    if retained.is_none() {
-                        current.selected = None;
-                    }
-                    let name = iso.name.clone();
-                    let size = human(iso.size);
-                    let local_file = retained
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Sin descargar".into());
-                    ui(weak.clone(), move |w| {
-                        w.set_iso_name(name.into());
-                        w.set_iso_size(size.into());
-                        w.set_iso_stage(if retained.is_some() { 3 } else { 1 });
-                        w.set_local_file(local_file.into());
-                        if retained.is_none() {
-                            w.set_selected_disk(-1);
-                            w.set_reuse_ventoy(false);
+                let result = match fetch_latest() {
+                    Ok(iso) => {
+                        // Volver a buscar también renueva el indicador de disponibilidad:
+                        // si no, seguiría mostrando el fallo de una comprobación anterior.
+                        status(weak.clone(), "Comprobando si la ISO se puede descargar…");
+                        let check = confirm_download_available(&iso);
+                        let (server, alternative) = availability_of(&check);
+                        show_found_iso(&weak, &state, &iso, server, alternative);
+                        match check {
+                            Ok(()) => Ok("ISO más reciente encontrada".into()),
+                            Err(_) if alternative == 1 => {
+                                Ok(MAIN_SERVER_UNAVAILABLE_MESSAGE.into())
+                            }
+                            Err(error) => Err(error),
                         }
-                    });
-                }
-                let result = match result {
-                    Ok(_) => Ok("ISO más reciente encontrada".into()),
+                    }
                     Err(error) if report_main_server_failure(weak.clone()) => {
                         log_event(format!("WARNING etapa=consultar_iso detalle={error}"));
                         Ok(MAIN_SERVER_UNAVAILABLE_MESSAGE.into())
@@ -2791,6 +2852,34 @@ mod tests {
             published: 0,
         };
         assert!(check_download_available(&iso).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn availability_retries_a_transient_not_found() {
+        // SourceForge responde 404 mientras replica una ISO recién subida.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for response in [
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/3\r\nContent-Length: 1\r\nConnection: close\r\n\r\nX",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let iso = Iso {
+            name: "test.iso".into(),
+            url: format!("http://{address}/test.iso"),
+            size: 3,
+            md5: None,
+            published: 0,
+        };
+        // Solo termina si hubo un segundo intento tras el 404.
+        confirm_download_available(&iso).unwrap();
         server.join().unwrap();
     }
 
