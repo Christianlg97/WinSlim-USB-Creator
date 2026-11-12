@@ -10,6 +10,19 @@ export struct DiskRow {
     number: int,
 }
 
+// Slint 1.18.1 con renderizado parcial (el de Windows): cuando la sesión acumula más
+// de 1024 cambios de texto, su caché de maquetación descarta entradas y un Text deja de
+// repintarse al cambiar su contenido si no cambia nada más (color, tamaño o posición):
+// la ventana mostraba un mensaje antiguo hasta recuperar el foco. Este Text alterna su
+// color un 1 % de opacidad (imperceptible) con cada cambio para que siempre se repinte.
+// Úsalo, con `base-color` en lugar de `color`, en todo texto que cambie con la app abierta.
+component LiveText inherits Text {
+    in property <color> base-color: #ffffff;
+    private property <bool> flip;
+    changed text => { flip = !flip; }
+    color: flip ? base-color.transparentize(1%) : base-color;
+}
+
 component ActionButton inherits Rectangle {
     in property <string> label;
     in property <string> help-text: "";
@@ -27,9 +40,9 @@ component ActionButton inherits Rectangle {
     border-color: !enabled ? #77777733 : primary ? #e5e5e5 : destructive ? button-touch.has-hover ? #c77882 : #87545a : quiet ? button-touch.has-hover ? #aaaaaa7a : #88888855 : button-touch.has-hover ? #bdbdbd99 : #aaaaaa66;
     border-width: 1px;
     animate background, border-color { duration: 120ms; }
-    Text {
+    LiveText {
         text: root.label;
-        color: !root.enabled ? #898989 : root.primary ? #111111 : root.destructive ? #f6bec4 : root.quiet ? #d0d0d0 : #f5f5f5;
+        base-color: !root.enabled ? #898989 : root.primary ? #111111 : root.destructive ? #f6bec4 : root.quiet ? #d0d0d0 : #f5f5f5;
         font-size: 14px;
         font-weight: 600;
         horizontal-alignment: center;
@@ -97,12 +110,12 @@ component RoundedSelect inherits Rectangle {
     border-width: 1px;
     animate background, border-color { duration: 120ms; }
 
-    Text {
+    LiveText {
         x: 13px;
         width: parent.width - 43px;
         height: parent.height;
         text: root.options[root.current-index];
-        color: root.enabled ? #f5f5f5 : #898989;
+        base-color: root.enabled ? #f5f5f5 : #898989;
         font-family: "Ubuntu Sans";
         font-size: 14px;
         font-weight: 600;
@@ -492,7 +505,7 @@ export component MainWindow inherits Window {
                             StepBadge { number: "01"; current: root.active-step == 1; done: root.active-step > 1; }
                             Text { text: "Selecciona de dónde cargas la imagen:"; color: #f0f2f5; font-size: 16px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
                         }
-                        Text {
+                        LiveText {
                             text: root.download-active
                                 ? "Buscando o descargando la ISO. Puedes cancelar el proceso en cualquier momento."
                                 : root.iso-stage == 1
@@ -504,7 +517,7 @@ export component MainWindow inherits Window {
                                 : root.alternative-mode
                                 ? "La ISO no está disponible en el servidor principal. Prueba con «Descarga alternativa de la ISO» o elige una imagen de tu equipo con «Cargar ISO local»."
                                 : "Selecciona «Buscar última ISO de WinSlim en línea» para consultar la versión más reciente, o «Cargar ISO local» para elegir una imagen de tu equipo.";
-                            color: #b9c0cc;
+                            base-color: #b9c0cc;
                             font-size: 14px;
                             font-weight: 700;
                             wrap: word-wrap;
@@ -512,9 +525,9 @@ export component MainWindow inherits Window {
                         HorizontalLayout {
                             height: 26px;
                             spacing: 10px;
-                            Text {
+                            LiveText {
                                 text: root.iso-name;
-                                color: #ffffff;
+                                base-color: #ffffff;
                                 font-size: 17px;
                                 font-weight: 600;
                                 max-width: 460px;
@@ -528,9 +541,9 @@ export component MainWindow inherits Window {
                                 background: #303030e8;
                                 border-color: #a0a0a078;
                                 border-width: 1px;
-                                Text {
+                                LiveText {
                                     text: root.iso-size;
-                                    color: #dedede;
+                                    base-color: #dedede;
                                     font-size: 13px;
                                     font-weight: 600;
                                     horizontal-alignment: center;
@@ -549,18 +562,18 @@ export component MainWindow inherits Window {
                                     background: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #51cc79 : root.alternative-only ? #e0b24f : root.server-availability == -1 ? #e56868 : #aab3be;
                                 }
                             }
-                            Text {
+                            LiveText {
                                 text: root.iso-stage == 2 && !root.download-active ? "ISO local cargada" : root.server-availability == 1 ? "Servidor en línea · Última ISO de WinSlim disponible para descargar" : root.alternative-only ? "ISO no disponible en el servidor principal · Prueba la descarga alternativa" : root.server-availability == -1 ? "Descarga no disponible" : "Comprobando disponibilidad de la ISO…";
-                                color: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #9be4ae : root.alternative-only ? #f0d08c : root.server-availability == -1 ? #f0a4a4 : #afb4bd;
+                                base-color: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #9be4ae : root.alternative-only ? #f0d08c : root.server-availability == -1 ? #f0a4a4 : #afb4bd;
                                 font-size: 14px;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
                                 overflow: elide;
                             }
                         }
-                        if root.iso-stage == 2 && !root.download-active : Text {
+                        if root.iso-stage == 2 && !root.download-active : LiveText {
                             text: "Ruta de origen: " + root.local-file;
-                            color: #afb4bd;
+                            base-color: #afb4bd;
                             font-size: 14px;
                             wrap: word-wrap;
                             vertical-stretch: 0;
@@ -780,7 +793,7 @@ export component MainWindow inherits Window {
                             Text { text: "Selecciona la unidad USB en la que prepararemos la instalación de la ISO de WinSlim."; color: #f0f2f5; font-size: 16px; font-weight: 700; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1; }
                             ActionButton { label: "Volver a detectar unidades"; help-text: "Vuelve a buscar las unidades USB conectadas y actualiza la lista."; help-align-right: true; width: 220px; enabled: !root.busy; clicked => { root.refresh-usb(); } }
                         }
-                        Text { text: root.usb-detecting ? "Buscando unidades USB…" : root.disks.length == 0 ? "No se detectaron unidades USB" : root.reuse-ventoy ? "Ventoy detectado: puedes copiar sin borrar o formatear la unidad de nuevo" : "La unidad seleccionada se formateará y perderá todo su contenido."; color: #afb4bd; font-size: 14px; font-weight: 700; }
+                        LiveText { text: root.usb-detecting ? "Buscando unidades USB…" : root.disks.length == 0 ? "No se detectaron unidades USB" : root.reuse-ventoy ? "Ventoy detectado: puedes copiar sin borrar o formatear la unidad de nuevo" : "La unidad seleccionada se formateará y perderá todo su contenido."; base-color: #afb4bd; font-size: 14px; font-weight: 700; }
                         HorizontalLayout {
                             padding-top: 6px;
                             spacing: 12px;
@@ -802,8 +815,8 @@ export component MainWindow inherits Window {
                                             padding-top: 10px;
                                             padding-bottom: 10px;
                                             spacing: 5px;
-                                            Text { text: disk.label; color: #f5f5f5; font-size: 14px; font-weight: 600; overflow: elide; }
-                                            Text { text: disk.detail; color: #aeb3bc; font-size: 12px; overflow: elide; }
+                                            LiveText { text: disk.label; base-color: #f5f5f5; font-size: 14px; font-weight: 600; overflow: elide; }
+                                            LiveText { text: disk.detail; base-color: #aeb3bc; font-size: 12px; overflow: elide; }
                                         }
                                         disk-touch := TouchArea { enabled: !root.busy; clicked => { root.select-disk(disk.number); } }
                                     }
@@ -876,13 +889,13 @@ export component MainWindow inherits Window {
                             height: root.width < 900px ? 42px : 28px;
                             spacing: 10px;
                             StepBadge { number: "03"; current: root.active-step == 3; done: root.active-step > 3; }
-                            Text {
+                            LiveText {
                                 text: root.preparation-complete
                                     ? "USB preparado. Puedes cerrar la aplicación o iniciar desde la unidad."
                                     : root.reuse-ventoy
                                     ? "Copia la ISO sin borrar los archivos, o formatea y prepara de nuevo la unidad con el formato seleccionado."
                                     : "Elige el formato de la unidad y pulsa «Preparar USB» para instalar Ventoy y copiar la ISO.";
-                                color: #f0f2f5;
+                                base-color: #f0f2f5;
                                 font-size: 16px;
                                 font-weight: 700;
                                 wrap: word-wrap;
@@ -936,7 +949,7 @@ export component MainWindow inherits Window {
                 padding-bottom: 10px;
                 spacing: 7px;
                 // Hasta dos líneas: las indicaciones largas no se cortan en ventanas estrechas.
-                Text { text: root.status-text; color: #f1f3f6; font-size: 16px; font-weight: 700; wrap: word-wrap; overflow: elide; vertical-stretch: 1; }
+                LiveText { text: root.status-text; base-color: #f1f3f6; font-size: 16px; font-weight: 700; wrap: word-wrap; overflow: elide; vertical-stretch: 1; }
                 HorizontalLayout {
                     height: 18px;
                     spacing: 6px;
@@ -948,9 +961,9 @@ export component MainWindow inherits Window {
                             background: root.tpm-status == 1 ? #51cc79 : root.tpm-status == 0 ? #e7a34f : #9d9d9d;
                         }
                     }
-                    Text {
+                    LiveText {
                         text: root.tpm-status == 1 ? "TPM: Habilitado" : root.tpm-status == 0 ? "TPM: Deshabilitado / no disponible" : root.tpm-status == -2 ? "TPM: Comprobando…" : "TPM: No se pudo comprobar";
-                        color: #d0d0d0; font-size: 13px; vertical-alignment: center; horizontal-stretch: 0;
+                        base-color: #d0d0d0; font-size: 13px; vertical-alignment: center; horizontal-stretch: 0;
                     }
                     Rectangle { width: 12px; background: transparent; }
                     Rectangle {
@@ -960,9 +973,9 @@ export component MainWindow inherits Window {
                             background: root.secure-boot-status == 1 ? #e56868 : root.secure-boot-status == 0 ? #51cc79 : #9d9d9d;
                         }
                     }
-                    Text {
+                    LiveText {
                         text: root.secure-boot-status == 1 ? "Secure Boot: Habilitado" : root.secure-boot-status == 0 ? "Secure Boot: Deshabilitado" : root.secure-boot-status == -2 ? "Secure Boot: Comprobando…" : "Secure Boot: No se pudo comprobar";
-                        color: #d0d0d0; font-size: 13px; vertical-alignment: center; horizontal-stretch: 0;
+                        base-color: #d0d0d0; font-size: 13px; vertical-alignment: center; horizontal-stretch: 0;
                     }
                 }
                 Rectangle {
@@ -1082,7 +1095,7 @@ export component MainWindow inherits Window {
             Rectangle {
                 x: 25px; y: 210px; width: parent.width - 50px; height: 48px;
                 border-radius: 8px; background: #303030dd; border-color: #aaaaaa55; border-width: 1px;
-                Text { text: root.success-detail; x: 12px; width: parent.width - 24px; color: #f1f2f3; font-size: 13px; font-weight: 600; overflow: elide; vertical-alignment: center; }
+                LiveText { text: root.success-detail; x: 12px; width: parent.width - 24px; base-color: #f1f2f3; font-size: 13px; font-weight: 600; overflow: elide; vertical-alignment: center; }
             }
             Rectangle {
                 x: 25px; y: 268px; width: parent.width - 50px; height: 72px;
@@ -1094,7 +1107,7 @@ export component MainWindow inherits Window {
                     x: 13px; y: 31px; width: 9px; height: 9px; border-radius: 5px;
                     background: root.secure-boot-status == 1 ? #e56868 : root.secure-boot-status == 0 ? #51cc79 : #a0a0a0;
                 }
-                Text {
+                LiveText {
                     x: 32px; y: 7px; width: parent.width - 44px; height: 58px;
                     text: root.secure-boot-status == 1
                         ? "Secure Boot habilitado. Desactívalo en UEFI antes de arrancar desde este USB para evitar «Security Violation [0x0]» y vuelve a activarlo al terminar la instalación."
@@ -1103,14 +1116,14 @@ export component MainWindow inherits Window {
                         : root.secure-boot-status == -2
                         ? "Comprobando el estado de Secure Boot antes de iniciar la instalación…"
                         : "No se pudo comprobar Secure Boot. Verifica en UEFI que esté deshabilitado antes de arrancar desde el USB para evitar «Security Violation [0x0]» y reactívalo tras la instalación.";
-                    color: root.secure-boot-status == 1 ? #f1c6cb : root.secure-boot-status == 0 ? #b9dfbf : #d6d6d6;
+                    base-color: root.secure-boot-status == 1 ? #f1c6cb : root.secure-boot-status == 0 ? #b9dfbf : #d6d6d6;
                     font-size: 13px; font-weight: 600; wrap: word-wrap; vertical-alignment: center;
                 }
             }
-            Text {
+            LiveText {
                 text: root.restart-message == "" ? root.restart-instructions : root.restart-message;
                 x: 30px; y: 353px; width: parent.width - 60px; height: 42px;
-                color: root.restart-message == "" ? #afb7c0 : #f2c3bb;
+                base-color: root.restart-message == "" ? #afb7c0 : #f2c3bb;
                 font-size: 13px; wrap: word-wrap; horizontal-alignment: center;
             }
             HorizontalLayout {
@@ -1141,17 +1154,17 @@ export component MainWindow inherits Window {
             VerticalLayout {
                 padding: 25px;
                 spacing: 14px;
-                Text {
+                LiveText {
                     text: root.download-active || root.preparing ? "¿Cerrar con una operación en curso?" : "La operación ha terminado";
-                    color: #ffffff; font-size: 21px; font-weight: 700; wrap: word-wrap;
+                    base-color: #ffffff; font-size: 21px; font-weight: 700; wrap: word-wrap;
                 }
-                Text {
+                LiveText {
                     text: root.download-active
                         ? "La descarga se detendrá. El progreso se conserva y podrás reanudarla la próxima vez que la inicies."
                         : root.preparing
                         ? "La preparación del USB se interrumpirá y la unidad puede quedar sin terminar. Tendrás que prepararla de nuevo."
                         : "Ya puedes cerrar la aplicación sin interrumpir nada.";
-                    color: #d1d4da; font-size: 14px; wrap: word-wrap;
+                    base-color: #d1d4da; font-size: 14px; wrap: word-wrap;
                 }
                 Rectangle { vertical-stretch: 1; background: transparent; }
                 HorizontalLayout {

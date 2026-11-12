@@ -18,7 +18,7 @@
 [Arquitectura](#-arquitectura-del-sistema) •
 [Script de Subida](#-análisis-técnico-del-script-sourceforge_upload_isocmd) •
 [Nomenclatura ISO](#-convención-de-nomenclatura-de-isos) •
-[Roadmap Herramienta USB](#-ecosistema-futuro-winslim-usb-installer--ventoy-core) •
+[Herramienta USB](#-winslim-usb-creator-herramienta-de-escritorio) •
 [Guía de Uso](#-guía-de-despliegue-y-uso) •
 [Troubleshooting](#-resolución-de-problemas)
 
@@ -37,7 +37,7 @@ Debido al tamaño de las imágenes completas de instalación (típicamente **~9.
 
 Este repositorio (**`WinSlim11_ISOS`**) cumple una doble función estratégica:
 1. **Pipeline de Ingesta y Despliegue:** Alojar la lógica de automatización desatendida ([SourceForge_Upload_ISO.cmd](SourceForge_Upload_ISO.cmd)) que autogestiona el entorno de dependencias POSIX (`Cygwin64`, `rsync`, `OpenSSH`), valida los artefactos y realiza transferencias delta resilientes hacia la red CDN de SourceForge.
-2. **Backbone de Enlaces Directos para Distribución Automatizada:** Generar y estandarizar los puntos de enlace directos (`downloads.sourceforge.net/project/...`) que serán consumidos por el futuro software cliente: un creador de instaladores USB basado en el código fuente de **Ventoy** con arranque **GRUB personalizado**.
+2. **Backbone de Enlaces Directos para Distribución Automatizada:** Generar y estandarizar los puntos de enlace directos (`downloads.sourceforge.net/project/...`) que consume la herramienta cliente [**WinSlim USB Creator**](WinSlimUsbCreator/README.md): un creador de USB de instalación basado en **Ventoy** con tema **GRUB personalizado**.
 
 ---
 
@@ -58,30 +58,32 @@ flowchart TD
 
     subgraph CLOUD["2. Red de Distribución (SourceForge FRS CDN)"]
         FRS["SourceForge Storage Server\nfrs.sourceforge.net\n/home/frs/project/winslim11-isos/"]
-        MIRRORS["Red Global de Réplicas (Mirrors CDN)\ndownloads.sourceforge.net"]
+        MIRRORS["Servidor de descarga\ndownloads.sourceforge.net\n→ master.dl.sourceforge.net"]
+        ALT["Descarga alternativa\nGoogle Drive (enlace en la release\nLatest_Mirror_URL de GitHub)"]
         
         CYG -- "Rsync over SSH\n(-avhP --partial-dir)" --> FRS
         FRS --> MIRRORS
     end
 
-    subgraph FUTURE["3. Herramienta Cliente Downstream (En Desarrollo)"]
-        CLIENT["WinSlim USB Creator Tool\n(Core Ventoy Source)"]
-        GRUB["Inyector de GRUB Custom\n(Temas WinSlim11 + ventoy.json)"]
+    subgraph APP["3. WinSlim USB Creator (Rust + Slint)"]
+        CLIENT["WinSlim USB Creator\n(descarga por tramos + Ventoy 1.1.17)"]
+        GRUB["Tema GRUB WinSlim\n+ ventoy.json"]
         TARGET_USB["Unidad Pendrive USB\n[VTOYEFI] + [Partición Datos NTFS/exFAT]"]
         
-        MIRRORS -- "Descarga Directa\nHTTP/HTTPS Stream" --> CLIENT
+        MIRRORS -- "Tramos HTTP en paralelo\n(verificación MD5)" --> CLIENT
+        ALT -. "Tramos HTTP en paralelo\n(si está disponible)" .-> CLIENT
         CLIENT --> GRUB
         GRUB --> TARGET_USB
-        CLIENT -- "Inyección de ISO sin extraer" --> TARGET_USB
+        CLIENT -- "Copia de la ISO sin extraer" --> TARGET_USB
     end
 
     classDef localStyle fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
     classDef cloudStyle fill:#0f172a,stroke:#fb923c,stroke-width:2px,color:#f8fafc;
-    classDef futureStyle fill:#111827,stroke:#4ade80,stroke-width:2px,color:#f8fafc;
+    classDef appStyle fill:#111827,stroke:#4ade80,stroke-width:2px,color:#f8fafc;
 
     class LOCAL,ISO,CMD,CYG localStyle;
-    class CLOUD,FRS,MIRRORS cloudStyle;
-    class FUTURE,CLIENT,GRUB,TARGET_USB futureStyle;
+    class CLOUD,FRS,MIRRORS,ALT cloudStyle;
+    class APP,CLIENT,GRUB,TARGET_USB appStyle;
 ```
 
 ---
@@ -190,52 +192,70 @@ Una vez completada la subida por el script, los enlaces quedan accesibles públi
 
 * **Portal del Repositorio en SourceForge:**
   `https://sourceforge.net/projects/winslim11-isos/files/`
-* **Endpoint de Descarga Directa (Resuelto por CDN Mirror):**
+* **Endpoint de Descarga Directa (redirige al servidor de descarga):**
   `https://downloads.sourceforge.net/project/winslim11-isos/<NOMBRE_ARCHIVO_ISO>`
 * **Ejemplo para la compilación actual:**
   `https://downloads.sourceforge.net/project/winslim11-isos/WinSlim11_ESx64_R1.5_P-2.2.2_240926_Rev62_DEV.iso`
 
-> [!TIP]
-> El endpoint `downloads.sourceforge.net/project/...` redirige automáticamente mediante cabeceras HTTP `302 Found` al mirror geográficamente más cercano y con mayor ancho de banda disponible, facilitando descargas a máxima velocidad en cualquier parte del mundo.
+> [!NOTE]
+> El endpoint `downloads.sourceforge.net/project/...` responde con un `302 Found` hacia el servidor de descarga. En las mediciones de noviembre de 2026, todos los espejos de este proyecto redirigían a `master.dl.sourceforge.net`, que limita cada conexión a unos cientos de KB/s. Por eso WinSlim USB Creator descarga por tramos con varias conexiones a la vez y, si está disponible, suma la descarga alternativa.
+>
+> Una ISO recién subida aparece en el RSS unos minutos antes de poder descargarse: mientras tanto, su URL de descarga responde `404`.
 
 ---
 
-## 🚀 Ecosistema Futuro: WinSlim USB Installer & Ventoy Core
+## 🚀 WinSlim USB Creator: Herramienta de Escritorio
 
-Este repositorio constituye la primera etapa de una arquitectura más amplia. Los enlaces directos generados aquí serán consumidos por una aplicación independiente que se desarrollará próximamente: **WinSlim USB Boot Tool**.
+Los enlaces que publica este repositorio los consume [**WinSlim USB Creator**](WinSlimUsbCreator/README.md), una aplicación de escritorio nativa (Rust + Slint, sin navegador integrado) para **Windows 10/11 x64** y **Linux x86_64** que prepara un USB de instalación de WinSlim11 en tres pasos. El código está en [`WinSlimUsbCreator/`](WinSlimUsbCreator/) y el detalle técnico completo en su [README](WinSlimUsbCreator/README.md).
 
-### Objetivo de la Herramienta Downstream
+### Qué hace la aplicación
 
-Crear un instalador "Zero-Hassle" (un solo clic) para el usuario final:
-1. **Descubrimiento y Descarga:** La aplicación consultará los artefactos disponibles en SourceForge, ofrecerá al usuario elegir la edición (Release estable, DEV, perfiles específicos) y gestionará la descarga acelerada multihilo con verificación de hash SHA-256.
-2. **Motor Ventoy Core:** Aprovechando el código fuente abierto de **Ventoy** ([ventoy/Ventoy](https://github.com/ventoy/Ventoy)):
-   - Formateará la unidad USB seleccionada creando la tabla de particiones dual estándar (partición de arranque oculta `VTOYEFI` formateada en FAT + partición principal para datos en exFAT o NTFS).
-   - Instalará el core de arranque Ventoy sin requerir herramientas de terceros (como Rufus o BalenaEtcher).
-3. **GRUB Personalizado y Branding WinSlim11:**
-   - Inyección de un tema visual exclusivo de GRUB2 adaptado con la identidad visual de WinSlim11 (resolución nativa 1080p/4K, tipografías elegantes, iconos modernos).
-   - Inyección y configuración automática de `ventoy/ventoy.json` con:
-     - **Bypass Automático:** Eliminación de chequeos de TPM 2.0, Secure Boot, RAM mínima de 4GB y requisito de cuenta Microsoft en Windows 11.
-     - **Menú de Arranque Custom:** Alias limpios para las ISOs, ocultando nombres técnicos largos y ofreciendo opciones de instalación desatendida directa.
-4. **Despliegue Directo de la ISO:**
-   - La ISO se coloca directamente en el pendrive sin extraer su contenido, permitiendo que la unidad USB conserve su capacidad de almacenamiento habitual y admita múltiples sistemas si el usuario lo desea.
+1. **Obtener la ISO (paso 01):**
+   - Consulta el RSS de SourceForge y elige la ISO `WinSlim*.iso` de la raíz del proyecto con la fecha de publicación más reciente. El nombre no está fijado en el código y siempre se propone la última versión publicada.
+   - **Descarga directa:** descarga la ISO dentro de la aplicación por tramos y desde varias fuentes a la vez: SourceForge y, si está disponible, la descarga alternativa de Google Drive publicada en la release [`Latest_Mirror_URL`](https://github.com/Christianlg97/WinSlim_Mirroring/releases/tag/Latest_Mirror_URL). Usa hasta 16 conexiones simultáneas, se reanuda tras un corte y solo acepta la ISO si su **MD5** coincide con el que publica SourceForge.
+   - **Descarga alternativa:** abre el enlace de Google Drive en el navegador.
+   - **ISO local:** permite elegir una imagen ya descargada y continuar sin conexión.
+   - Indica si la ISO está disponible en el servidor principal, solo en la descarga alternativa o en ninguno.
+2. **Elegir el USB (paso 02):** detecta las unidades USB sin permisos de administrador y excluye los discos del sistema.
+3. **Preparar el USB (paso 03):**
+   - Instala el paquete **oficial de Ventoy 1.1.17** incluido en la aplicación (comprobado por SHA-256 antes de usarlo), con el esquema de particiones (MBR o GPT) y el sistema de archivos (exFAT o NTFS) elegidos: partición de arranque `VTOYEFI` y partición de datos con la etiqueta **WinSlim USB**. Pide confirmar el borrado y vuelve a comprobar la identidad del disco justo antes de modificarlo.
+   - Si el USB ya tiene Ventoy, puede copiar la ISO sin formatear ni borrar los demás archivos.
+   - Copia la ISO tal cual, sin extraer su contenido, y la verifica por MD5 releyéndola del USB sin la caché del sistema, lo que detecta pendrives defectuosos o de capacidad falsa.
+   - Instala el tema GRUB **WinSlim** en `/ventoy/winslim-theme` y configura `ventoy/ventoy.json` con el menú gráfico, el idioma `es_ES` y el texto de versión de Ventoy oculto. Conserva el resto de la configuración existente y no sustituye un tema personalizado distinto.
+4. **Al terminar:** muestra el estado de TPM y Secure Boot, avisa de desactivar Secure Boot para evitar «Security Violation [0x0]» y permite reiniciar hacia el menú de arranque (Inicio avanzado en Windows, configuración del firmware en Linux).
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor User as Usuario
-    participant App as WinSlim USB Tool
-    participant SF as SourceForge CDN
-    participant Disk as Motor Ventoy (Disco USB)
-    participant GRUB as Configurator (GRUB & JSON)
+    participant App as WinSlim USB Creator
+    participant SF as SourceForge
+    participant ALT as Descarga alternativa (Google Drive)
+    participant Disk as Unidad USB
 
-    User->>App: Selecciona versión de WinSlim11 y unidad USB
-    App->>SF: Solicita binario (Direct Link)
-    SF-->>App: Stream de datos con SHA-256 Checksum
-    App->>Disk: Particionamiento MBR/GPT + VTOYEFI (Ventoy Core)
-    App->>GRUB: Inyecta Tema Custom WinSlim11 & ventoy.json
-    App->>Disk: Copia directa de WinSlim11_*.iso en partición de datos
-    Disk-->>User: Pendrive USB listo para arrancar e instalar
+    App->>SF: Consulta el RSS (última WinSlim*.iso y su MD5)
+    App->>SF: Comprueba que la ISO se puede descargar
+    User->>App: Descarga directa de la ISO
+    par Tramos en paralelo
+        App->>SF: Peticiones Range
+    and
+        App->>ALT: Peticiones Range (si está disponible)
+    end
+    App->>App: Verifica tamaño y MD5
+    User->>App: Elige USB, esquema de partición y sistema de archivos
+    App->>Disk: Instala Ventoy 1.1.17 o reutiliza el existente
+    App->>Disk: Copia la ISO y la verifica por MD5 sin caché
+    App->>Disk: Tema GRUB WinSlim y ventoy.json
+    Disk-->>User: USB listo para arrancar e instalar
 ```
+
+### Pendiente del plan original
+
+Estas ideas del planteamiento inicial **no están implementadas**:
+- Elegir edición o canal (estable, DEV, perfiles concretos) en lugar de la última ISO publicada.
+- Configurar en `ventoy.json` la omisión de los requisitos de Windows 11 (TPM 2.0, Secure Boot, 4 GB de RAM y cuenta Microsoft).
+- Alias legibles para las ISOs en el menú de arranque y opciones de instalación desatendida.
+- Validar la instalación real en USB y el arranque BIOS/UEFI en hardware (ver el límite actual en el [README de la aplicación](WinSlimUsbCreator/README.md)).
 
 ---
 

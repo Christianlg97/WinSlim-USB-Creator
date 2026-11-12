@@ -121,6 +121,7 @@ Ambos módulos exponen exactamente la misma interfaz `pub(super)` hacia `main.rs
 
 - **Componentes internos:**
   - `DiskRow` (`struct`): `{ label, detail, number }`.
+  - `LiveText`: `Text` cuyo color (`base-color` en lugar de `color`) alterna un 1 % de opacidad con cada cambio de `text`, para esquivar un fallo de Slint 1.18.1 (ver §6, regla 8). Lo usan la barra de estado, el paso 01 (descripción, nombre/tamaño de ISO, disponibilidad, ruta local), los avisos y filas de discos, el paso 03, TPM/Secure Boot, las etiquetas de `ActionButton`/`RoundedSelect` y los textos variables de los modales de éxito y cierre.
   - `ActionButton`: botón con variantes `primary`, `quiet`, `destructive`, `enabled` y popup de ayuda contextual tras 2500 ms de hover (`PopupWindow`).
   - `RoundedSelect` y `FormatSelect`: selector desplegable personalizado para esquema de partición (`MBR` / `GPT`) y sistema de archivos (`exFAT` / `NTFS`).
   - `StepBadge`: indicador numérico o `✓` para los pasos `01`, `02` y `03`.
@@ -146,6 +147,7 @@ Ambos módulos exponen exactamente la misma interfaz `pub(super)` hacia `main.rs
 5. **Disponibilidad e ISOs de SourceForge:** no fijar nombres de ISO ni URLs de espejos en el código. Aceptar solo `WinSlim*.iso` en la raíz del proyecto (ignorando `.rsync-partial/` u otras subcarpetas). En `check_download_available()`, no exigir `Content-Length` ni `Content-Range` obligatorios (algunos espejos válidos usan transferencia chunked o ignoran `Range` devolviendo `200`), pero rechazar siempre `text/html` o tamaños declarados que contradigan el RSS.
 6. **Integridad de Ventoy embebido:** los paquetes en `vendor/` se validan por SHA-256 antes de usarse. En Windows, la copia extraída en `%LOCALAPPDATA%` debe verificarse archivo por archivo (`extracted_ventoy_matches`) antes de reutilizarse con elevación UAC. No modificar los archivos de `vendor/` salvo actualización explícita de versión y hash.
 7. **Paridad multiplataforma:** cualquier cambio en el flujo o en la interfaz `pub(super)` de `platform` debe mantenerse sincronizado entre `src/platform/windows.rs` y `src/platform/linux.rs`.
+8. **Textos que cambian con la app abierta → `LiveText`:** con el renderizado parcial de Slint 1.18.1, tras más de 1024 cambios de texto en la sesión (`ENTRY_LIMIT` de su `TextLayoutCache`) la caché descarta entradas y el `Text` pierde la dependencia con su contenido: si cambia el texto pero no su color ni su geometría, la zona no se repinta (se veía un mensaje antiguo hasta recuperar el foco). Todo `Text` con contenido variable debe ser `LiveText` con `base-color`. Revisar si una versión posterior de Slint lo corrige antes de quitarlo.
 
 ---
 
@@ -173,6 +175,7 @@ cargo test
 
 ## 8. Historial de cambios relevantes
 
+- **2026-11-12:** corregida la barra de estado congelada durante la descarga («Buscando servidores de descarga…» hasta pulsar Alt+Tab). Causa: fallo de dependencias de la caché de texto de Slint 1.18.1 con renderizado parcial (§6, regla 8), reproducido con el mismo renderizador (8/8 actualizaciones sin repintar tras >1024 cambios de texto; 0/8 con la corrección). Nuevo componente `LiveText` aplicado a los 19 textos variables de `ui/main.slint`.
 - **2026-11-12:** «Volver a buscar la última ISO» repite la comprobación de disponibilidad y actualiza `server-availability`/`alternative-availability` (antes solo leía el RSS y el aviso «ISO no disponible en el servidor principal» del arranque se quedaba fijo junto a la ISO encontrada). La comprobación reintenta 3 veces (una ISO recién subida da 404 en SourceForge unos minutos) y, mientras falla, el temporizador la repite cada 2 min en lugar de cada 10.
 - **2026-11-11:** la descarga alternativa vuelve a abrir el enlace de Drive en el navegador y su mensaje indica que después se use «Cargar ISO local»; el diálogo de «Cargar ISO local» se abre en la carpeta Descargas y el texto de estado (`status-text`) admite dos líneas (`wrap: word-wrap`).
 - **2026-11-11:** `scripts/build-windows.ps1` compila con `rustup.exe run stable-x86_64-pc-windows-msvc cargo ...` en lugar del proxy `.cargo\bin\cargo.exe`: si los proxies de rustup son enlaces simbólicos, Windows PowerShell no puede ejecutarlos («No hay ninguna aplicación asociada con el archivo»).
