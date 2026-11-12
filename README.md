@@ -198,7 +198,7 @@ Una vez completada la subida por el script, los enlaces quedan accesibles públi
   `https://downloads.sourceforge.net/project/winslim11-isos/WinSlim11_ESx64_R1.5_P-2.2.2_240926_Rev62_DEV.iso`
 
 > [!NOTE]
-> El endpoint `downloads.sourceforge.net/project/...` responde con un `302 Found` hacia el servidor de descarga. En las mediciones de noviembre de 2026, todos los espejos de este proyecto redirigían a `master.dl.sourceforge.net`, que limita cada conexión a unos cientos de KB/s. Por eso WinSlim USB Creator descarga por tramos con varias conexiones a la vez y, si está disponible, suma la descarga alternativa.
+> El endpoint `downloads.sourceforge.net/project/...` responde con un `302 Found` hacia un espejo de descarga. Los espejos que sirven la ISO varían: el 11/11/2026 solo respondía `master.dl.sourceforge.net` y el 12/11/2026 respondieron ocho. Cada conexión con SourceForge es lenta (de unos cientos de KB/s a ~1 MB/s), así que WinSlim USB Creator descarga por tramos con varias conexiones y espejos a la vez y, si está disponible, suma la descarga alternativa.
 >
 > Una ISO recién subida aparece en el RSS unos minutos antes de poder descargarse: mientras tanto, su URL de descarga responde `404`.
 

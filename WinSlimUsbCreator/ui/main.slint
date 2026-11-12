@@ -295,8 +295,14 @@ export component MainWindow inherits Window {
     in-out property <string> iso-size: "";
     // -1: descarga no disponible; 0: comprobando; 1: ISO accesible.
     in-out property <int> server-availability: 0;
-    // -1: sin descarga alternativa; 0: sin comprobar; 1: enlace alternativo accesible.
+    // -1: sin descarga alternativa; 0: comprobando; 1: enlace alternativo accesible.
     in-out property <int> alternative-availability: 0;
+    // Fila de disponibilidad del paso 01.
+    private property <bool> local-iso-shown: root.iso-stage == 2 && !root.download-active;
+    private property <bool> servers-pending: root.server-availability == 0 || root.alternative-availability == 0;
+    private property <bool> sources-shown: !root.local-iso-shown && !root.servers-pending;
+    // 1 verde, -1 rojo, 0 gris para el primer indicador de la fila.
+    private property <int> main-tone: root.local-iso-shown ? 1 : root.servers-pending ? 0 : root.server-availability;
     // El servidor principal no ofrece la ISO, pero la descarga alternativa sí.
     private property <bool> alternative-only: root.server-availability == -1 && root.alternative-availability == 1;
     // Pasos sin ISO que descargar del servidor principal: se ofrece la alternativa junto a la búsqueda.
@@ -552,6 +558,8 @@ export component MainWindow inherits Window {
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                         }
+                        // Disponibilidad: ISO local, «Conectando…» mientras se comprueba o el estado
+                        // de cada fuente (verde disponible, rojo no disponible, gris comprobando).
                         HorizontalLayout {
                             height: 20px;
                             spacing: 8px;
@@ -559,17 +567,37 @@ export component MainWindow inherits Window {
                                 width: 10px; height: 20px; background: transparent;
                                 Rectangle {
                                     y: 5px; width: 10px; height: 10px; border-radius: 5px;
-                                    background: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #51cc79 : root.alternative-only ? #e0b24f : root.server-availability == -1 ? #e56868 : #aab3be;
+                                    background: root.main-tone == 1 ? #51cc79 : root.main-tone == -1 ? #e56868 : #aab3be;
                                 }
                             }
                             LiveText {
-                                text: root.iso-stage == 2 && !root.download-active ? "ISO local cargada" : root.server-availability == 1 ? "Servidor en línea · Última ISO de WinSlim disponible para descargar" : root.alternative-only ? "ISO no disponible en el servidor principal · Prueba la descarga alternativa" : root.server-availability == -1 ? "Descarga no disponible" : "Comprobando disponibilidad de la ISO…";
-                                base-color: (root.iso-stage == 2 && !root.download-active) || root.server-availability == 1 ? #9be4ae : root.alternative-only ? #f0d08c : root.server-availability == -1 ? #f0a4a4 : #afb4bd;
+                                text: root.local-iso-shown ? "ISO local cargada"
+                                    : root.servers-pending ? "Conectando con los servidores de descarga…"
+                                    : root.server-availability == 1 ? "Servidor principal: disponible"
+                                    : "Servidor principal: no disponible";
+                                base-color: root.main-tone == 1 ? #9be4ae : root.main-tone == -1 ? #f0a4a4 : #afb4bd;
                                 font-size: 14px;
                                 vertical-alignment: center;
-                                horizontal-stretch: 1;
+                                horizontal-stretch: 0;
                                 overflow: elide;
                             }
+                            if root.sources-shown : Rectangle { width: 14px; background: transparent; }
+                            if root.sources-shown : Rectangle {
+                                width: 10px; height: 20px; background: transparent;
+                                Rectangle {
+                                    y: 5px; width: 10px; height: 10px; border-radius: 5px;
+                                    background: root.alternative-availability == 1 ? #51cc79 : #e56868;
+                                }
+                            }
+                            if root.sources-shown : LiveText {
+                                text: root.alternative-availability == 1 ? "Descarga alternativa: disponible" : "Descarga alternativa: no disponible";
+                                base-color: root.alternative-availability == 1 ? #9be4ae : #f0a4a4;
+                                font-size: 14px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 0;
+                                overflow: elide;
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
                         }
                         if root.iso-stage == 2 && !root.download-active : LiveText {
                             text: "Ruta de origen: " + root.local-file;

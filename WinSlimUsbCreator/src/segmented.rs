@@ -835,7 +835,7 @@ fn report_progress(
     );
     let fraction = (received as f64 / size as f64).clamp(0.0, 1.0) as f32;
     ui(weak.clone(), move |window| {
-        window.set_status_text(message.into());
+        show_status(&window, message.into());
         window.set_progress(fraction);
     });
 }
@@ -964,7 +964,7 @@ pub(super) fn download_segmented(
                 human(iso.size)
             );
             ui(weak.clone(), move |window| {
-                window.set_status_text(message.into());
+                show_status(&window, message.into());
                 window.set_progress(fraction);
             });
             thread::sleep(Duration::from_millis(250));

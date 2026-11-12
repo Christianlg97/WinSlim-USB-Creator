@@ -62,6 +62,23 @@ const DOWNLOAD_RUNNING: u8 = 1;
 const DOWNLOAD_CANCELLED: u8 = 2;
 const DOWNLOAD_COMMITTING: u8 = 3;
 const DOWNLOAD_CANCELLED_MESSAGE: &str = "Descarga cancelada";
+/// Cancelación que además borró el archivo parcial de la descarga.
+const DOWNLOAD_DISCARDED_MESSAGE: &str = "Descarga cancelada. Se eliminó la parte ya descargada.";
+
+fn is_cancellation(error: &str) -> bool {
+    error == DOWNLOAD_CANCELLED_MESSAGE || error == DOWNLOAD_DISCARDED_MESSAGE
+}
+
+/// La ISO ya estaba en la carpeta de descargas: no se descargó, solo se verificó.
+const ISO_ALREADY_DOWNLOADED_MESSAGE: &str = "La ISO ya estaba descargada y se ha verificado";
+
+/// ISO lista en la carpeta de descargas, con tamaño y MD5 comprobados.
+#[derive(Debug)]
+struct DownloadedIso {
+    path: PathBuf,
+    /// Ya estaba descargada: solo se verificó, no se descargó nada.
+    reused: bool,
+}
 /// A partir de este tamaño la ISO se descarga por tramos y desde varias fuentes.
 const PARALLEL_MIN_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MIRROR_PROBES: usize = 8;
@@ -202,7 +219,10 @@ impl Drop for PanicGuard {
             window.set_download_cancelling(false);
             window.set_preparing(false);
             window.set_progress(0.0);
-            window.set_status_text("Error interno inesperado. Consulta el Registro.".into());
+            show_status(
+                &window,
+                "Error interno inesperado. Consulta el Registro.".into(),
+            );
         });
     }
 }
@@ -215,9 +235,22 @@ fn ui<F: FnOnce(MainWindow) + Send + 'static>(weak: slint::Weak<MainWindow>, f: 
     });
 }
 
+/// Cambia el texto de la barra de estado y repinta la ventana entera.
+///
+/// Con el renderizado parcial de Slint 1.18.1 en Windows, el texto de estado se
+/// quedó congelado en pantalla aunque su valor cambiaba (la barra de progreso de
+/// al lado sí avanzaba) y solo se corregía al repintar toda la ventana con
+/// Alt+Tab. Invertir `redraw-flip` provoca ese mismo repintado completo, que
+/// cuesta 1-4 ms y ocurre como mucho cuatro veces por segundo.
+/// Todo cambio del texto de estado debe pasar por aquí.
+fn show_status(window: &MainWindow, text: slint::SharedString) {
+    window.set_status_text(text);
+    window.set_redraw_flip(!window.get_redraw_flip());
+}
+
 fn status(weak: slint::Weak<MainWindow>, message: impl Into<String>) {
     let message = message.into();
-    ui(weak, move |window| window.set_status_text(message.into()));
+    ui(weak, move |window| show_status(&window, message.into()));
 }
 
 fn finish(weak: slint::Weak<MainWindow>, result: Result<String, String>, state: Arc<Mutex<State>>) {
@@ -229,10 +262,13 @@ fn finish(weak: slint::Weak<MainWindow>, result: Result<String, String>, state: 
     ui(weak, move |window| {
         window.set_busy(false);
         window.set_preparing(false);
-        window.set_status_text(match result {
-            Ok(message) => message.into(),
-            Err(message) => format!("Error: {message}").into(),
-        });
+        show_status(
+            &window,
+            match result {
+                Ok(message) => message.into(),
+                Err(message) => format!("Error: {message}").into(),
+            },
+        );
     });
 }
 
@@ -245,7 +281,7 @@ fn finish_download(
     let cancelled = result
         .as_ref()
         .err()
-        .is_some_and(|error| error == DOWNLOAD_CANCELLED_MESSAGE);
+        .is_some_and(|error| is_cancellation(error));
     download_state.store(DOWNLOAD_IDLE, Ordering::Release);
     ui(weak.clone(), move |window| {
         window.set_download_active(false);
@@ -254,10 +290,11 @@ fn finish_download(
             window.set_progress(0.0);
         }
     });
+    // Una cancelación no es un error: se muestra su mensaje tal cual.
     finish(
         weak,
         if cancelled {
-            Ok("Descarga cancelada. Archivo parcial eliminado.".into())
+            Ok(result.unwrap_err())
         } else {
             result
         },
@@ -557,7 +594,10 @@ fn alternative_availability() -> i32 {
 
 /// Marca el servidor principal como no disponible y comprueba si queda la alternativa.
 fn report_main_server_failure(weak: slint::Weak<MainWindow>) -> bool {
-    status(weak.clone(), "Comprobando la descarga alternativa…");
+    ui(weak.clone(), |window| {
+        window.set_server_availability(0);
+        window.set_alternative_availability(0);
+    });
     let alternative = alternative_availability();
     ui(weak, move |window| {
         window.set_server_availability(-1);
@@ -566,15 +606,9 @@ fn report_main_server_failure(weak: slint::Weak<MainWindow>) -> bool {
     alternative == 1
 }
 
-/// Muestra en el paso 01 la ISO encontrada en el RSS junto con su disponibilidad.
+/// Muestra en el paso 01 la ISO encontrada en el RSS, con su disponibilidad pendiente de confirmar.
 /// Conserva la ISO ya descargada si es la misma versión y sigue en disco.
-fn show_found_iso(
-    weak: &slint::Weak<MainWindow>,
-    state: &Arc<Mutex<State>>,
-    iso: &Iso,
-    server: i32,
-    alternative: i32,
-) {
+fn show_found_iso(weak: &slint::Weak<MainWindow>, state: &Arc<Mutex<State>>, iso: &Iso) {
     let mut current = lock_state(state);
     let retained = if current.iso.as_ref().is_some_and(|previous| {
         previous.url == iso.url
@@ -605,14 +639,15 @@ fn show_found_iso(
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Sin descargar".into());
-    // Todo en una sola actualización para que el paso 01 no cambie de diseño dos veces.
     ui(weak.clone(), move |w| {
         w.set_iso_name(name.into());
         w.set_iso_size(size.into());
         w.set_iso_stage(if retained.is_some() { 3 } else { 1 });
         w.set_local_file(local_file.into());
-        w.set_server_availability(server);
-        w.set_alternative_availability(alternative);
+        // Disponibilidad pendiente: el paso 01 muestra «Conectando con los servidores
+        // de descarga…» hasta que la comprobación publica el resultado.
+        w.set_server_availability(0);
+        w.set_alternative_availability(0);
         if retained.is_none() {
             w.set_selected_disk(-1);
             w.set_reuse_ventoy(false);
@@ -809,7 +844,7 @@ fn download_iso(
     iso: &Iso,
     weak: slint::Weak<MainWindow>,
     download_state: &AtomicU8,
-) -> Result<PathBuf, String> {
+) -> Result<DownloadedIso, String> {
     let dir = downloads_dir()?;
     download_iso_to(iso, weak, &dir, download_state)
 }
@@ -819,11 +854,11 @@ fn download_iso_to(
     weak: slint::Weak<MainWindow>,
     dir: &Path,
     download_state: &AtomicU8,
-) -> Result<PathBuf, String> {
+) -> Result<DownloadedIso, String> {
     let result = download_iso_to_inner(iso, weak, dir, download_state);
-    if let Ok(path) = &result {
+    if let Ok(downloaded) = &result {
         // Todas las salidas correctas han comprobado tamaño y MD5.
-        remember_verified_iso(path, iso);
+        remember_verified_iso(&downloaded.path, iso);
     }
     if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED
         || result
@@ -833,14 +868,19 @@ fn download_iso_to(
     {
         let part = dir.join(format!("{}.part", iso.name));
         let segments = dir.join(format!("{}.part-segments", iso.name));
-        match fs::remove_file(&part) {
-            Ok(()) => log_event(format!(
-                "INFO etapa=descargar_iso cancelada archivo_parcial_eliminado={}",
-                part.display()
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Al cancelar la verificación de una ISO ya descargada no hay nada parcial
+        // que borrar, y el mensaje no debe decir lo contrario.
+        let discarded = match fs::remove_file(&part) {
+            Ok(()) => {
+                log_event(format!(
+                    "INFO etapa=descargar_iso cancelada archivo_parcial_eliminado={}",
+                    part.display()
+                ));
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(file_error("eliminar descarga cancelada", &part, error)),
-        }
+        };
         // Carpeta de fragmentos de versiones anteriores del descargador.
         if segments.exists() {
             fs::remove_dir_all(&segments)
@@ -852,7 +892,12 @@ fn download_iso_to(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(file_error("eliminar progreso cancelado", &progress, error)),
         }
-        return Err(DOWNLOAD_CANCELLED_MESSAGE.into());
+        return Err(if discarded {
+            DOWNLOAD_DISCARDED_MESSAGE
+        } else {
+            DOWNLOAD_CANCELLED_MESSAGE
+        }
+        .into());
     }
     result
 }
@@ -862,7 +907,7 @@ fn download_iso_to_inner(
     weak: slint::Weak<MainWindow>,
     dir: &Path,
     download_state: &AtomicU8,
-) -> Result<PathBuf, String> {
+) -> Result<DownloadedIso, String> {
     check_download_cancellation(download_state)?;
     fs::create_dir_all(dir).map_err(|e| file_error("crear carpeta de descarga", dir, e))?;
     let final_path = dir.join(&iso.name);
@@ -886,7 +931,10 @@ fn download_iso_to_inner(
             "INFO etapa=descargar_iso archivo_existente_verificado ruta={}",
             final_path.display()
         ));
-        return Ok(final_path);
+        return Ok(DownloadedIso {
+            path: final_path,
+            reused: true,
+        });
     }
     let part = dir.join(format!("{}.part", iso.name));
     // Las ISO grandes con MD5 publicado se descargan por tramos desde todas las
@@ -917,7 +965,10 @@ fn download_iso_to_inner(
                 "INFO etapa=descargar_iso completada ruta={}",
                 final_path.display()
             ));
-            return Ok(final_path);
+            return Ok(DownloadedIso {
+                path: final_path,
+                reused: false,
+            });
         }
     }
     // La descarga de una conexión espera un `.part` continuo desde el principio.
@@ -970,7 +1021,10 @@ fn download_iso_to_inner(
             }
             fs::rename(&part, &final_path)
                 .map_err(|e| file_error("finalizar descarga", &final_path, e))?;
-            return Ok(final_path);
+            return Ok(DownloadedIso {
+                path: final_path,
+                reused: false,
+            });
         }
         fs::remove_file(&part)
             .map_err(|e| file_error("descartar descarga incorrecta", &part, e))?;
@@ -1149,7 +1203,7 @@ fn download_iso_to_inner(
                 );
                 let fraction = (downloaded as f64 / iso.size as f64).clamp(0.0, 1.0) as f32;
                 ui(weak.clone(), move |window| {
-                    window.set_status_text(message.into());
+                    show_status(&window, message.into());
                     window.set_progress(fraction);
                 });
                 last_update = Instant::now();
@@ -1211,7 +1265,10 @@ fn download_iso_to_inner(
         start.elapsed().as_secs(),
         final_path.display()
     ));
-    Ok(final_path)
+    Ok(DownloadedIso {
+        path: final_path,
+        reused: false,
+    })
 }
 
 fn parse_mirror_choices(html: &str) -> Vec<String> {
@@ -1384,21 +1441,24 @@ fn confirm_download_available(iso: &Iso) -> Result<(), String> {
     }
 }
 
-/// Registra el resultado de la comprobación del servidor principal y, si falló,
-/// comprueba la alternativa. Devuelve `(server-availability, alternative-availability)`.
-fn availability_of(check: &Result<(), String>) -> (i32, i32) {
-    match check {
-        Ok(()) => {
-            log_event("INFO etapa=comprobar_servidor iso_disponible=true".into());
-            (1, 0)
-        }
-        Err(error) => {
-            log_event(format!(
+/// Comprueba a la vez el servidor principal (`main_check`) y la descarga alternativa,
+/// que el paso 01 muestra siempre por separado. Devuelve el resultado del servidor
+/// principal y los valores de `server-availability` y `alternative-availability`.
+fn check_servers(
+    main_check: impl FnOnce() -> Result<(), String>,
+) -> (Result<(), String>, i32, i32) {
+    thread::scope(|scope| {
+        let alternative = scope.spawn(alternative_availability);
+        let check = main_check();
+        match &check {
+            Ok(()) => log_event("INFO etapa=comprobar_servidor iso_disponible=true".into()),
+            Err(error) => log_event(format!(
                 "WARNING etapa=comprobar_servidor iso_disponible=false detalle={error}"
-            ));
-            (-1, alternative_availability())
+            )),
         }
-    }
+        let server = if check.is_ok() { 1 } else { -1 };
+        (check, server, alternative.join().unwrap_or(-1))
+    })
 }
 
 fn start_server_check(weak: slint::Weak<MainWindow>, running: Arc<AtomicBool>) {
@@ -1414,10 +1474,10 @@ fn start_server_check(weak: slint::Weak<MainWindow>, running: Arc<AtomicBool>) {
             }
         }
         let _release = Release(running);
-        let check = fetch_latest().and_then(|iso| confirm_download_available(&iso));
-        // Ambos estados se publican juntos para no mostrar «Descarga no disponible»
-        // mientras todavía se comprueba la alternativa.
-        let (server, alternative) = availability_of(&check);
+        // Ambos estados se publican juntos: el paso 01 muestra «Conectando con los
+        // servidores de descarga…» hasta tener los dos.
+        let (_, server, alternative) =
+            check_servers(|| fetch_latest().and_then(|iso| confirm_download_available(&iso)));
         ui(weak, move |window| {
             window.set_server_availability(server);
             window.set_alternative_availability(alternative);
@@ -1465,7 +1525,7 @@ fn verify_file(
             let message = format!("{label} · {} / {}", human(checked), human(iso.size));
             let fraction = (checked as f64 / iso.size as f64).clamp(0.0, 1.0) as f32;
             ui(weak.clone(), move |window| {
-                window.set_status_text(message.into());
+                show_status(&window, message.into());
                 window.set_progress(fraction);
             });
             last_update = Instant::now();
@@ -1767,7 +1827,7 @@ fn copy_with_progress(
         let message = format!("{} · {} / {}", label, human(copied), human(total));
         let fraction = (copied as f64 / total as f64).clamp(0.0, 1.0) as f32;
         ui(weak.clone(), move |window| {
-            window.set_status_text(message.into());
+            show_status(&window, message.into());
             window.set_progress(fraction);
         });
     })
@@ -2033,7 +2093,8 @@ fn main() -> Result<(), slint::PlatformError> {
             {
                 if let Some(window) = weak.upgrade() {
                     window.set_download_cancelling(true);
-                    window.set_status_text(
+                    show_status(
+                        &window,
                         "Cancelando descarga y eliminando el archivo parcial…".into(),
                     );
                 }
@@ -2215,7 +2276,8 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(w) = weak.upgrade() {
                 match result {
                     Ok(_) => {
-                        w.set_status_text(
+                        show_status(
+                            &w,
                             format!("Registro exportado: {}", target.display()).into(),
                         );
                         log_event(format!(
@@ -2224,7 +2286,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         ));
                     }
                     Err(e) => {
-                        w.set_status_text(format!("No se pudo exportar el registro: {e}").into());
+                        show_status(&w, format!("No se pudo exportar el registro: {e}").into());
                         log_event(format!("ERROR etapa=registro exportar={e}"));
                     }
                 }
@@ -2240,19 +2302,25 @@ fn main() -> Result<(), slint::PlatformError> {
             if !begin(&state, &window) {
                 return;
             }
-            window.set_status_text("Consultando SourceForge…".into());
+            show_status(&window, "Buscando última versión disponible…".into());
             let weak = weak.clone();
             let state = state.clone();
             thread::spawn(move || {
                 let _guard = PanicGuard::new(&weak, &state, None);
                 let result = match fetch_latest() {
                     Ok(iso) => {
-                        // Volver a buscar también renueva el indicador de disponibilidad:
-                        // si no, seguiría mostrando el fallo de una comprobación anterior.
-                        status(weak.clone(), "Comprobando si la ISO se puede descargar…");
-                        let check = confirm_download_available(&iso);
-                        let (server, alternative) = availability_of(&check);
-                        show_found_iso(&weak, &state, &iso, server, alternative);
+                        // Primero se muestra la ISO encontrada y después se confirma que se
+                        // puede descargar. Volver a buscar también renueva el indicador: si
+                        // no, seguiría mostrando el fallo de una comprobación anterior. La
+                        // confirmación se ve en el indicador del paso 01; la barra de estado
+                        // sigue en «Buscando última versión disponible…» hasta el resultado.
+                        show_found_iso(&weak, &state, &iso);
+                        let (check, server, alternative) =
+                            check_servers(|| confirm_download_available(&iso));
+                        ui(weak.clone(), move |w| {
+                            w.set_server_availability(server);
+                            w.set_alternative_availability(alternative);
+                        });
                         match check {
                             Ok(()) => Ok("ISO más reciente encontrada".into()),
                             Err(_) if alternative == 1 => {
@@ -2284,7 +2352,7 @@ fn main() -> Result<(), slint::PlatformError> {
             download_state.store(DOWNLOAD_RUNNING, Ordering::Release);
             window.set_download_active(true);
             window.set_download_cancelling(false);
-            window.set_status_text("Buscando la última ISO de WinSlim…".into());
+            show_status(&window, "Buscando última versión disponible…".into());
             let weak = weak.clone();
             let state = state.clone();
             let download_state = download_state.clone();
@@ -2295,7 +2363,8 @@ fn main() -> Result<(), slint::PlatformError> {
                         if download_state.load(Ordering::Acquire) == DOWNLOAD_RUNNING {
                             status(weak.clone(), "Descargando la última ISO de WinSlim…");
                         }
-                        download_iso(&iso, weak.clone(), &download_state).map(|path| (iso, path))
+                        download_iso(&iso, weak.clone(), &download_state)
+                            .map(|downloaded| (iso, downloaded))
                     }
                     Err(_) if download_state.load(Ordering::Acquire) == DOWNLOAD_CANCELLED => {
                         Err(DOWNLOAD_CANCELLED_MESSAGE.into())
@@ -2306,7 +2375,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                     Err(error) => Err(error),
                 };
-                if let Ok((iso, path)) = &result {
+                if let Ok((iso, downloaded)) = &result {
+                    let path = &downloaded.path;
                     {
                         let mut current = lock_state(&state);
                         current.iso = Some(iso.clone());
@@ -2331,7 +2401,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 finish_download(
                     weak,
-                    result.map(|_| "Última ISO descargada y verificada".into()),
+                    result.map(|(_, downloaded)| {
+                        if downloaded.reused {
+                            ISO_ALREADY_DOWNLOADED_MESSAGE.into()
+                        } else {
+                            "Última ISO descargada y verificada".into()
+                        }
+                    }),
                     state,
                     download_state,
                 );
@@ -2360,9 +2436,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 let result = iso
                     .ok_or("Busca primero una ISO".to_owned())
                     .and_then(|iso| {
-                        download_iso(&iso, weak.clone(), &download_state).map(|path| (iso, path))
+                        download_iso(&iso, weak.clone(), &download_state)
+                            .map(|downloaded| (iso, downloaded))
                     });
-                if let Ok((iso, path)) = &result {
+                if let Ok((iso, downloaded)) = &result {
+                    let path = &downloaded.path;
                     {
                         let mut current = lock_state(&state);
                         current.local_iso = Some(path.clone());
@@ -2382,7 +2460,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 finish_download(
                     weak,
-                    result.map(|_| "Descarga completada y verificada".into()),
+                    result.map(|(_, downloaded)| {
+                        if downloaded.reused {
+                            ISO_ALREADY_DOWNLOADED_MESSAGE.into()
+                        } else {
+                            "Descarga completada y verificada".into()
+                        }
+                    }),
                     state,
                     download_state,
                 );
@@ -2400,7 +2484,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             // La indicación se muestra ya al pulsar: el navegador se abre encima de
             // la ventana y taparía un mensaje que solo apareciera después.
-            window.set_status_text("Abriendo la descarga en el navegador. Cuando termine, pulsa «Cargar ISO local» y elige la ISO descargada.".into());
+            show_status(&window, "Abriendo la descarga en el navegador. Cuando termine, pulsa «Cargar ISO local» y elige la ISO descargada.".into());
             let weak = weak.clone();
             let state = state.clone();
             thread::spawn(move || {
@@ -2451,20 +2535,23 @@ fn main() -> Result<(), slint::PlatformError> {
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
             {
-                window.set_status_text("Selecciona un archivo con extensión .iso".into());
+                show_status(&window, "Selecciona un archivo con extensión .iso".into());
                 return;
             }
             let size = match fs::metadata(&path) {
                 Ok(meta) if meta.is_file() && meta.len() >= 100_000_000 => meta.len(),
                 Ok(_) => {
-                    window.set_status_text(
+                    show_status(
+                        &window,
                         "La ISO local no es un archivo válido o está incompleta".into(),
                     );
                     return;
                 }
                 Err(error) => {
-                    window
-                        .set_status_text(format!("No se pudo abrir la ISO local: {error}").into());
+                    show_status(
+                        &window,
+                        format!("No se pudo abrir la ISO local: {error}").into(),
+                    );
                     return;
                 }
             };
@@ -2498,7 +2585,10 @@ fn main() -> Result<(), slint::PlatformError> {
             window.set_preparation_complete(false);
             window.set_selected_disk(-1);
             window.set_reuse_ventoy(false);
-            window.set_status_text("ISO local cargada. Selecciona un USB para continuar.".into());
+            show_status(
+                &window,
+                "ISO local cargada. Selecciona un USB para continuar.".into(),
+            );
             window.set_progress(0.0);
         });
     }
@@ -2512,7 +2602,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             }
             window.set_usb_detecting(true);
-            window.set_status_text("Buscando unidades USB…".into());
+            show_status(&window, "Buscando unidades USB…".into());
             log_event("INFO etapa=detectar_usb inicio".into());
             let weak = weak.clone();
             let state = state.clone();
@@ -2571,7 +2661,10 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(window) = weak.upgrade() else { return };
             let mut state = lock_state(&state);
             if state.iso.is_none() || state.local_iso.is_none() {
-                window.set_status_text("Descarga o carga una ISO antes de preparar el USB".into());
+                show_status(
+                    &window,
+                    "Descarga o carga una ISO antes de preparar el USB".into(),
+                );
                 return;
             }
             let Some(number) = state.selected else { return };
@@ -2581,12 +2674,13 @@ fn main() -> Result<(), slint::PlatformError> {
             let reuse = match ventoy_data_location(disk) {
                 Ok(letter) => letter.is_some(),
                 Err(error) => {
-                    window.set_status_text(error.into());
+                    show_status(&window, error.into());
                     return;
                 }
             };
             if force_reinstall && !reuse {
-                window.set_status_text(
+                show_status(
+                    &window,
                     "No se detecta Ventoy en esta unidad. Actualiza la lista antes de prepararla."
                         .into(),
                 );
@@ -3056,7 +3150,8 @@ mod tests {
         let download_state = AtomicU8::new(DOWNLOAD_RUNNING);
         let result = download_iso_to(&iso, slint::Weak::default(), &dir, &download_state).unwrap();
         server.join().unwrap();
-        assert_eq!(fs::read(result).unwrap(), data);
+        assert_eq!(fs::read(&result.path).unwrap(), data);
+        assert!(!result.reused);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3137,10 +3232,7 @@ mod tests {
                 Ordering::Acquire,
             )
             .unwrap();
-        assert_eq!(
-            worker.join().unwrap().unwrap_err(),
-            DOWNLOAD_CANCELLED_MESSAGE
-        );
+        assert!(is_cancellation(&worker.join().unwrap().unwrap_err()));
         server.join().unwrap();
         assert!(!dir.join("cancel.iso.part").exists());
         assert!(!dir.join("cancel.iso").exists());
@@ -3550,7 +3642,7 @@ mod tests {
         };
         let result = download_iso_to(&iso, slint::Weak::default(), &dir, &state);
         canceller.join().unwrap();
-        assert_eq!(result.unwrap_err(), DOWNLOAD_CANCELLED_MESSAGE);
+        assert!(is_cancellation(&result.err().unwrap()));
         let part = dir.join(format!("{}.part", iso.name));
         assert!(!part.exists());
         assert!(!segmented::state_path(&part).exists());
