@@ -54,6 +54,13 @@ try {
         if ($LASTEXITCODE -ne 0) { Fail "No se pudo instalar la toolchain de Rust. Codigo: $LASTEXITCODE" }
     }
     Write-Host (& $rustup run stable-x86_64-pc-windows-msvc rustc --version)
+    # Cargo lanza `rustc` por nombre y Windows lo resuelve al proxy .cargo\bin\rustc.exe.
+    # Si ese proxy es un enlace simbolico creado sin elevar, un proceso elevado
+    # (CMD "Ejecutar como administrador") no puede seguirlo: "punto de montaje no
+    # confiable (os error 448)". RUSTC apunta al rustc real de la toolchain.
+    $rustc = @(& $rustup which --toolchain stable-x86_64-pc-windows-msvc rustc)[0]
+    if ($LASTEXITCODE -ne 0 -or -not $rustc -or -not (Test-Path -LiteralPath $rustc)) { Fail 'No se encontro rustc en la toolchain de Rust.' }
+    $env:RUSTC = $rustc
 
     if ($CheckOnly) { Write-Host 'Dependencias disponibles.' -ForegroundColor Green; exit 0 }
 

@@ -325,8 +325,12 @@ export component MainWindow inherits Window {
     preferred-height: 1040px;
     min-width: 680px;
     min-height: 530px;
-    // Cambiar este color un nivel invalida toda la superficie tras restaurar la ventana.
-    background: redraw-flip ? #101011 : #101010;
+    // Invertir `redraw-flip` cambia el valor del fondo y obliga a repintar toda la ventana
+    // (tras restaurarla y en cada mensaje de estado). Ambos valores pintan exactamente
+    // #101010: el degradado tiene sus dos paradas iguales. No alternar dos colores
+    // distintos: #101011 (un nivel más de azul) se veía como un parpadeo azulado
+    // cuatro veces por segundo durante la descarga, la verificación y la copia.
+    background: redraw-flip ? @linear-gradient(180deg, #101010 0%, #101010 100%) : #101010;
     default-font-family: "Ubuntu Sans";
 
     in-out property <bool> redraw-flip: false;
